@@ -32,6 +32,5 @@ ssl
 !docker/nginx/*.conf
 docker/*/.user.ini
 
-.vexp
-.infra-llm.env
 infra-llm/
+.infra-llm.env

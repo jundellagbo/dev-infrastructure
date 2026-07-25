@@ -1,10 +1,8 @@
-# Agent workflow state - machine-local scratch, never part of an image.
-infra-llm/
-.infra-llm.env
-
 # Local editor / agent config
 .claude/
 
 # Version control
 .git/
 .gitignore
+infra-llm/
+.infra-llm.env

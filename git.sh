@@ -1,11 +1,6 @@
-# Git shortcuts
+# Git shortcuts, the branch prompt and the worktree helpers.
 #
-# Companion: llm.sh (agent workflow - infra-llm --init, llmplan, llmsteps, ...)
-# is sourced at the bottom of this file.
-#
-# Sourcing this file directly works and is self-contained. commands.sh is the
-# usual entry point (what install.sh wires into ~/.bashrc): it loads this file
-# plus llm.sh, and re-sources both when the checkout changes.
+# Self-contained: source this file directly. install.sh wires it into ~/.bashrc.
 
 # Commit
 alias gcom='git commit -m'
@@ -161,19 +156,9 @@ _gwtadd() {
 
   # Untracked env files never come along with the checkout - carry them over
   local f
-  for f in .env .env.local .infra-llm.env; do
+  for f in .env .env.local; do
     [ -f "${root}/${f}" ] && [ ! -e "${path}/${f}" ] && cp "${root}/${f}" "${path}/${f}"
   done
-
-  # Give the worktree its own agent state (plans + session records) so an agent
-  # can start here in parallel with whatever is running in the other worktrees
-  if declare -F _llm_wt_prep >/dev/null 2>&1; then
-    _llm_wt_prep "$path" >/dev/null
-  else
-    # Fallback for a shell that sourced git.sh without llm.sh - the names have
-    # to match LLM_PLANS_DIR / LLM_SESSIONS_DIR over there
-    mkdir -p "${path}/infra-llm/plans" "${path}/infra-llm/sessions"
-  fi
 
   echo "worktree ready: $path"
   cd "$path" || return 1
@@ -243,6 +228,33 @@ _gwt_rm_tree() {
   return 1
 }
 
+# codebase-memory-mcp indexes a repo by its working-directory path, so a worktree
+# that was indexed is its own project keyed by the worktree path - deleting the
+# tree leaves that index behind, pointing at files that no longer exist. These
+# helpers find and drop it through the tool's own CLI. Both are best-effort: the
+# tool may not be installed, and a memory-index hiccup must never block a
+# teardown, so nothing here returns non-zero into gwtrm's flow.
+_gwt_cbm_bin() { command -v codebase-memory-mcp 2>/dev/null; }
+
+# True when an index exists for exactly this worktree path. list_projects prints
+# JSON holding each project's absolute path, so a literal match on the quoted
+# path is enough and needs no JSON parser.
+_gwt_cbm_has_index() {
+  local path="$1" bin
+  [ -n "$path" ] || return 1
+  bin="$(_gwt_cbm_bin)" || return 1
+  "$bin" cli list_projects '{}' 2>/dev/null | grep -qF "\"$path\""
+}
+
+_gwt_cbm_cleanup() {
+  local path="$1" bin
+  [ -n "$path" ] || return 0
+  bin="$(_gwt_cbm_bin)" || return 0
+  if "$bin" cli delete_project --project "$path" >/dev/null 2>&1; then
+    echo "removed codebase-memory index for $path"
+  fi
+}
+
 _gwtrm() {
   local branch="" want_path="" force=0 assume_yes=0 skip_docker=0 keep_branch=0 keep_remote=0
   local usage="usage: gwtrm <branch> [path] [-f] [-y] [--no-docker] [--keep-branch] [--keep-remote]"
@@ -267,7 +279,7 @@ _gwtrm() {
     return 1
   fi
 
-  local root path has_remote=0 remote_stale=0 remote_offline=0
+  local root path has_remote=0 remote_stale=0 remote_offline=0 has_cbm=0
   root="$(_gwt_root)" || return 1
   if [ -n "$want_path" ]; then
     if [ ! -d "$want_path" ]; then
@@ -283,6 +295,9 @@ _gwtrm() {
     path="$PWD"
     [ "$path" != "$root" ] && [ -e "${path}/.git" ] || path=""
   fi
+  # Did anything index this worktree? Checked now so the preview can list it.
+  _gwt_cbm_has_index "$path" && has_cbm=1
+
   # Ask origin itself. refs/remotes/origin/<branch> only says what the last
   # fetch saw: missing there (never fetched) is why a delete used to be skipped
   # silently, and present-but-stale is a tracking ref to clean up, not a push.
@@ -302,6 +317,7 @@ _gwtrm() {
   echo "about to remove:"
   [ -n "$path" ] && echo "  worktree      $path"
   [ $skip_docker -eq 0 ] && [ -n "$path" ] && echo "  docker        containers/volumes/images/networks for $(_gwt_compose_project "$path")"
+  [ $has_cbm -eq 1 ] && echo "  cbm index     codebase-memory index for $path"
   [ $keep_branch -eq 0 ] && echo "  local branch  $branch"
   if [ $keep_remote -eq 0 ] && [ $has_remote -eq 1 ]; then
     if [ $remote_offline -eq 1 ]; then
@@ -339,6 +355,10 @@ _gwtrm() {
   fi
   # Drops the now-dangling .git/worktrees/<name> admin directory as well
   git worktree prune
+
+  # The tree is gone; drop its codebase-memory index so it stops pointing at
+  # files that no longer exist. Best-effort - never fails the teardown.
+  [ $has_cbm -eq 1 ] && _gwt_cbm_cleanup "$path"
 
   if [ $keep_branch -eq 0 ] && git show-ref --verify --quiet "refs/heads/$branch"; then
     git branch -D "$branch"
@@ -393,7 +413,7 @@ alias gwho='git shortlog -s --'
 # Project tooling
 alias sail='./vendor/bin/sail'
 
-# Git branch in PS1
+# Git branch in PS1 - the fallback prompt, used when starship isn't installed
 git_branch() {
   local branch status=""
 
@@ -417,12 +437,98 @@ git_branch() {
   echo " ($branch:$status)"
 }
 
-PS1='\[\e[32m\]\u@\h\[\e[0m\]:\[\e[34m\]\w\[\e[33m\]$(git_branch)\[\e[0m\]\$ '
+# The prompt: starship when it is installed (install.sh puts it in
+# /usr/local/bin and writes the config), the hand-rolled PS1 otherwise. Both
+# show the same thing - current directory and branch - so a machine without
+# starship is not a machine with a worse prompt, and neither half of this
+# depends on the other being there.
+#
+# Interactive shells only: a script that sources this file has no prompt to
+# draw, and `starship init` costs a subprocess to produce one nobody sees.
+#
+# Idempotent: a login shell may have already had starship initialised by the
+# machine-wide /etc/profile.d/starship.sh install.sh drops, and re-running
+# `starship init` would double-wrap PROMPT_COMMAND. starship_precmd existing
+# means it is already up, so only init when it isn't.
+if [ "${-#*i}" != "$-" ]; then
+  if command -v starship >/dev/null 2>&1; then
+    declare -F starship_precmd >/dev/null 2>&1 || eval "$(starship init bash)"
+  else
+    PS1='\[\e[32m\]\u@\h\[\e[0m\]:\[\e[34m\]\w\[\e[33m\]$(git_branch)\[\e[0m\]\$ '
+  fi
+fi
+
+# ------------------------------------------------------ reload when this changes
+
+# A shell sources this file once, at startup, and then runs whatever it read for
+# as long as it stays open - so an edit here reaches every terminal opened later
+# and none of the ones already running. That is the stale copy people hit after
+# changing an alias: the new shell has it, the shell they are standing in does
+# not. Comparing the file's stamp before each prompt closes that gap; the shell
+# re-sources itself on the next prompt after the checkout changes.
+#
+# llm.sh in llm-infrastructure does the same for itself. Neither file loads the
+# other, so each watches its own and the names are kept apart deliberately -
+# infra-reload over there is llm.sh's, and defining it here again would just
+# shadow whichever loaded first.
+_INFRA_GIT_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+# Sub-second precision, and whole seconds are not enough: two changes in the same
+# second read as one stamp, and since the stamp is only refreshed on reload, a
+# change landing in the same second as the last one compares equal forever - the
+# edit is missed permanently, not just until the next prompt. GNU's %.9Y and
+# BSD's %Fm both carry the fraction; ls does not, so that fallback keeps the old
+# coarse behaviour.
+_infra_git_stamp() {
+  stat -c %.9Y "$_INFRA_GIT_SH" 2>/dev/null \
+    || stat -f %Fm "$_INFRA_GIT_SH" 2>/dev/null \
+    || ls -l "$_INFRA_GIT_SH" 2>/dev/null
+}
+INFRA_GIT_STAMP="$(_infra_git_stamp)"
+
+# Re-source when the stamp moved. Quiet by default - a shell that reloads on
+# every edit should not narrate it.
+#
+# $? is captured first and handed back untouched: this runs inside
+# PROMPT_COMMAND, where anything that returns a status of its own overwrites the
+# one the prompt is about to render, and starship reads it to colour the final
+# character. A hook that reports on the last command must not become the last
+# command.
+_infra_git_reload_if_changed() {
+  local rc=$? now
+  now="$(_infra_git_stamp)"
+  if [ -n "$now" ] && [ "$now" != "$INFRA_GIT_STAMP" ]; then
+    INFRA_GIT_STAMP="$now"
+    . "$_INFRA_GIT_SH"
+  fi
+  return $rc
+}
+
+# Reload now, whether or not anything changed - for a shell opened before this
+# hook existed, or when no prompt hook runs. --all bumps the file's stamp so
+# every other open terminal reloads at its next prompt.
+infra-git-reload() {
+  . "$_INFRA_GIT_SH" && printf '  reloaded %s\n' "$_INFRA_GIT_SH"
+  if [ "$1" = "--all" ]; then
+    touch "$_INFRA_GIT_SH" 2>/dev/null
+    # After the touch, so this shell doesn't reload itself again on next prompt
+    INFRA_GIT_STAMP="$(_infra_git_stamp)"
+    printf '  other shells reload at their next prompt\n'
+  fi
+}
+
+# After starship, never before: its init moves any existing PROMPT_COMMAND into
+# STARSHIP_PROMPT_COMMAND and runs it from inside its own precmd, so a hook
+# added first would end up there and the check below would add a second copy.
+# Appending also leaves starship_precmd first, which is where it has to be to
+# read the real exit status.
+if [ "${-#*i}" != "$-" ]; then
+  case ";${PROMPT_COMMAND-};${STARSHIP_PROMPT_COMMAND-};" in
+    *";_infra_git_reload_if_changed;"*) ;;
+    ";;;"|";;") PROMPT_COMMAND="_infra_git_reload_if_changed" ;;
+    *) PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND};}_infra_git_reload_if_changed" ;;
+  esac
+fi
 
 bind '"\e[A": history-search-backward'
 bind '"\e[B": history-search-forward'
-
-# Agent/LLM workflow helpers (infra-llm --init, llmplan, llmsteps, claude_session, ...)
-_git_sh_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "$_git_sh_dir/llm.sh" ] && . "$_git_sh_dir/llm.sh"
-unset _git_sh_dir
