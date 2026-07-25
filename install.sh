@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Install PHP (multiple versions + switcher), Composer, WP-CLI, Node and the
-# starship prompt on the host.
+# Install PHP (multiple versions + switcher), Composer, WP-CLI, Node, git, the
+# GitHub CLI and the starship prompt on the host.
 #
 #   sudo ./install.sh                          # everything: PHP 8.3, default 8.3
 #   sudo ./install.sh --versions 8.2 8.3 8.4   # only these (also: --versions=8.2,8.3)
@@ -9,14 +9,19 @@
 #   sudo ./install.sh --no-composer --no-wp    # skip the extras
 #   sudo ./install.sh --no-node                # skip Node/nvm
 #   sudo ./install.sh --node-version 20        # install this Node major (default: --lts)
+#   sudo ./install.sh --no-git --no-gh         # skip git and the GitHub CLI
 #   sudo ./install.sh --no-starship            # skip the starship prompt
 #
-# Component selectors: --php --composer --wp --node --starship
+# git and gh are only installed when they are missing - a run never upgrades or
+# reconfigures the ones already on the box unless their selector asks for it.
+#
+# Component selectors: --php --composer --wp --node --git --gh --starship
 #
 # On their own they install ONLY what they name, and reinstall it if it is
 # already there. After --uninstall they remove only what they name.
 #
 #   sudo ./install.sh --node                   # (re)install just Node via nvm
+#   sudo ./install.sh --gh                     # (re)install just the GitHub CLI
 #   sudo ./install.sh --starship               # (re)install the prompt and its config
 #   sudo ./install.sh --php 8.2 8.3            # only these PHP versions
 #   sudo ./install.sh --uninstall --php 8.1 8.2 # uninstall selected PHP versions
@@ -52,11 +57,15 @@ INSTALL_COMPOSER=1
 INSTALL_WPCLI=1
 INSTALL_NODE=1
 NODE_VERSION="--lts"
+INSTALL_GIT=1
+INSTALL_GH=1
 INSTALL_STARSHIP=1
 UNINSTALL_PHP=0
 UNINSTALL_COMPOSER=0
 UNINSTALL_WPCLI=0
 UNINSTALL_NODE=0
+UNINSTALL_GIT=0
+UNINSTALL_GH=0
 UNINSTALL_STARSHIP=0
 UNINSTALL_ALL=0
 
@@ -66,6 +75,8 @@ SEL_PHP=0
 SEL_COMPOSER=0
 SEL_WPCLI=0
 SEL_NODE=0
+SEL_GIT=0
+SEL_GH=0
 SEL_STARSHIP=0
 selector=0
 # Picking a component explicitly means "(re)do this one", so the install steps
@@ -91,12 +102,16 @@ while [ $# -gt 0 ]; do
         --composer)         SEL_COMPOSER=1; selector=1 ;;
         --wp|--wpcli)       SEL_WPCLI=1; selector=1 ;;
         --node)             SEL_NODE=1; selector=1 ;;
+        --git)              SEL_GIT=1; selector=1 ;;
+        --gh|--github-cli)  SEL_GH=1; selector=1 ;;
         --starship)         SEL_STARSHIP=1; selector=1 ;;
         --default|-d)       DEFAULT_VERSION="$2"; shift ;;
         --default=*)        DEFAULT_VERSION="${1#*=}" ;;
         --no-composer)      INSTALL_COMPOSER=0 ;;
         --no-wp|--no-wpcli) INSTALL_WPCLI=0 ;;
         --no-node)          INSTALL_NODE=0 ;;
+        --no-git)           INSTALL_GIT=0 ;;
+        --no-gh)            INSTALL_GH=0 ;;
         --no-starship)      INSTALL_STARSHIP=0 ;;
         --node-version)     NODE_VERSION="$2"; shift ;;
         --node-version=*)   NODE_VERSION="${1#*=}" ;;
@@ -122,12 +137,16 @@ if [ "$UNINSTALL_MODE" -eq 1 ]; then
     if [ "$selector" -eq 0 ]; then
         # Bare --uninstall means everything this script manages
         UNINSTALL_ALL=1
-        SEL_PHP=1; SEL_COMPOSER=1; SEL_WPCLI=1; SEL_NODE=1; SEL_STARSHIP=1
+        SEL_PHP=1; SEL_COMPOSER=1; SEL_WPCLI=1; SEL_NODE=1; SEL_GH=1; SEL_STARSHIP=1
+        # Not SEL_GIT: git is a base tool the rest of this repo runs on, so a
+        # bare --uninstall never takes it away. "--uninstall --git" still says so.
     fi
     UNINSTALL_PHP=$SEL_PHP
     UNINSTALL_COMPOSER=$SEL_COMPOSER
     UNINSTALL_WPCLI=$SEL_WPCLI
     UNINSTALL_NODE=$SEL_NODE
+    UNINSTALL_GIT=$SEL_GIT
+    UNINSTALL_GH=$SEL_GH
     UNINSTALL_STARSHIP=$SEL_STARSHIP
 elif [ "$selector" -eq 1 ]; then
     # Install mode with selectors: only the named components, and they are
@@ -137,6 +156,8 @@ elif [ "$selector" -eq 1 ]; then
     INSTALL_COMPOSER=$SEL_COMPOSER
     INSTALL_WPCLI=$SEL_WPCLI
     INSTALL_NODE=$SEL_NODE
+    INSTALL_GIT=$SEL_GIT
+    INSTALL_GH=$SEL_GH
     INSTALL_STARSHIP=$SEL_STARSHIP
     FORCE_REINSTALL=1
 fi
@@ -228,6 +249,32 @@ if [ "$UNINSTALL_MODE" -eq 1 ]; then
         print_success "Node and nvm uninstalled"
     fi
 
+    if [ "$UNINSTALL_GH" -eq 1 ]; then
+        if command -v gh >/dev/null 2>&1 || [ -f /etc/apt/sources.list.d/github-cli.list ]; then
+            print_info "Uninstalling the GitHub CLI..."
+            apt-get purge -y -qq gh >/dev/null 2>&1 || true
+            # The repo and its key are ours, so they go with the package - left
+            # behind they keep showing up in every future apt update.
+            rm -f /etc/apt/sources.list.d/github-cli.list \
+                  /etc/apt/keyrings/githubcli-archive-keyring.gpg
+            apt-get update -qq >/dev/null 2>&1 || true
+            print_success "gh uninstalled"
+        else
+            print_warning "gh is not installed - skipping"
+        fi
+    fi
+
+    if [ "$UNINSTALL_GIT" -eq 1 ]; then
+        # Asked for explicitly (a bare --uninstall never selects git), and still
+        # declined: git.sh, the worktree helpers and this repo's whole agent
+        # workflow run on git, and apt would take every package depending on it
+        # along too. Removing it is a decision for a human at a prompt.
+        print_warning "not uninstalling git - git.sh, the worktree helpers and the"
+        print_warning "  agent workflow all need it, and apt would pull its dependents"
+        print_warning "  out with it. Remove it by hand if you really mean to:"
+        print_warning "  sudo apt-get purge git"
+    fi
+
     if [ "$UNINSTALL_STARSHIP" -eq 1 ]; then
         print_info "Uninstalling starship..."
         rm -f /usr/local/bin/starship
@@ -316,10 +363,23 @@ zip
 
 # ---------------------------------------------------------------- repositories
 
+# git and gh install only when they are missing, so settle that before the
+# prerequisite block: a box that already has both must not pull an apt update
+# along on their behalf. Their selectors (--git, --gh) force the work anyway.
+git_needed=0
+gh_needed=0
+if [ $INSTALL_GIT -eq 1 ] && { [ $FORCE_REINSTALL -eq 1 ] || ! command -v git >/dev/null 2>&1; }; then
+    git_needed=1
+fi
+if [ $INSTALL_GH -eq 1 ] && { [ $FORCE_REINSTALL -eq 1 ] || ! command -v gh >/dev/null 2>&1; }; then
+    gh_needed=1
+fi
+
 # The full prerequisite set is only needed by the apt-installed components.
 # Selecting just a per-user tool (--node) shouldn't drag an apt update along -
 # that installer only needs curl.
-if [ $INSTALL_PHP -eq 1 ] || [ $INSTALL_COMPOSER -eq 1 ] || [ $INSTALL_WPCLI -eq 1 ]; then
+if [ $INSTALL_PHP -eq 1 ] || [ $INSTALL_COMPOSER -eq 1 ] || [ $INSTALL_WPCLI -eq 1 ] \
+   || [ $git_needed -eq 1 ] || [ $gh_needed -eq 1 ]; then
     print_info "Installing prerequisites..."
     apt-get update -qq
     apt-get install -y -qq \
@@ -522,6 +582,66 @@ exec /usr/local/bin/wp-cli.phar "$@"
 EOF
     chmod +x /usr/local/bin/wp
     print_success "WP-CLI installed"
+fi
+
+# ------------------------------------------------------------------- git / gh
+
+# Both are install-when-missing: a box that already has them keeps the version
+# it has, because upgrading someone's git out from under them is not this
+# script's call. --git and --gh ask for the install regardless. Presence is
+# re-checked here rather than reused from git_needed, since the prerequisite
+# block above may already have pulled git in for the PHP path.
+
+if [ $INSTALL_GIT -eq 1 ]; then
+    if command -v git >/dev/null 2>&1 && [ $FORCE_REINSTALL -eq 0 ]; then
+        print_info "git already present ($(git --version 2>/dev/null))"
+    else
+        print_info "Installing git..."
+        apt-get install -y -qq git >/dev/null 2>&1 \
+            && print_success "git installed ($(git --version 2>/dev/null))" \
+            || print_warning "git install failed - 'apt-get install git' by hand"
+    fi
+fi
+
+if [ $INSTALL_GH -eq 1 ]; then
+    if command -v gh >/dev/null 2>&1 && [ $FORCE_REINSTALL -eq 0 ]; then
+        print_info "gh already present ($(gh --version 2>/dev/null | head -1))"
+    else
+        print_info "Installing the GitHub CLI..."
+        # Debian and Ubuntu ship a gh that trails upstream by a long way, so
+        # prefer GitHub's own apt repo and keep the distro package as the
+        # fallback - an unreachable key or a release the repo doesn't cover
+        # should still leave the box with a working gh.
+        gh_keyring=/etc/apt/keyrings/githubcli-archive-keyring.gpg
+        gh_list=/etc/apt/sources.list.d/github-cli.list
+        if [ ! -s "$gh_keyring" ] || [ $FORCE_REINSTALL -eq 1 ]; then
+            mkdir -p -m 755 /etc/apt/keyrings
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                -o "$gh_keyring" 2>/dev/null || true
+            chmod go+r "$gh_keyring" 2>/dev/null || true
+        fi
+        if [ -s "$gh_keyring" ]; then
+            printf 'deb [arch=%s signed-by=%s] https://cli.github.com/packages stable main\n' \
+                "$(dpkg --print-architecture)" "$gh_keyring" > "$gh_list"
+            chmod 644 "$gh_list"
+            apt-get update -qq || true
+        else
+            rm -f "$gh_keyring" "$gh_list"
+            print_warning "could not fetch GitHub's apt key - using the distro gh package"
+        fi
+
+        if apt-get install -y -qq gh >/dev/null 2>&1; then
+            print_success "gh installed ($(gh --version 2>/dev/null | head -1))"
+        else
+            # The repo is there but unusable for this release - drop it and take
+            # whatever gh the distro has rather than leaving the box without one.
+            rm -f "$gh_list"
+            apt-get update -qq || true
+            apt-get install -y -qq gh >/dev/null 2>&1 \
+                && print_success "gh installed from the distro package ($(gh --version 2>/dev/null | head -1))" \
+                || print_warning "gh install failed - see https://cli.github.com"
+        fi
+    fi
 fi
 
 # ------------------------------------------------------------------ node / nvm
@@ -736,6 +856,12 @@ if [ $INSTALL_NODE -eq 1 ]; then
     if [ -n "$node_ver" ]; then
         echo "  node      ${node_ver} (via nvm)"
     fi
+fi
+if [ $INSTALL_GIT -eq 1 ] && command -v git >/dev/null 2>&1; then
+    echo "  git       $(git --version 2>/dev/null)"
+fi
+if [ $INSTALL_GH -eq 1 ] && command -v gh >/dev/null 2>&1; then
+    echo "  gh        $(gh --version 2>/dev/null | head -1)"
 fi
 if [ $INSTALL_STARSHIP -eq 1 ] && [ -x /usr/local/bin/starship ]; then
     echo "  starship  $(/usr/local/bin/starship --version 2>/dev/null | head -1)"

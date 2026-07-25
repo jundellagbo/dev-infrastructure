@@ -9,7 +9,7 @@ Three independent parts — use one, two, or all three:
 | Part | What it is | Entry point |
 | ---- | ---------- | ----------- |
 | **Docker stack** | Nginx, Apache, PHP 7.4-8.4, MySQL, PostgreSQL, Redis, Adminer, MailHog, wildcard SSL and DNS for `*.dev.local` | `docker compose up -d` |
-| **Host tooling** | Host PHP versions + switcher, Composer, WP-CLI, Node via nvm, the starship prompt | `sudo ./install.sh` |
+| **Host tooling** | Host PHP versions + switcher, Composer, WP-CLI, Node via nvm, git, the GitHub CLI, the starship prompt | `sudo ./install.sh` |
 | **Shell helpers** | Git shortcuts, the prompt, reload-on-change, and worktree create/teardown | `source git.sh` |
 
 ```bash
@@ -114,7 +114,7 @@ warning on `https://*.dev.local` means the CA certificate isn't trusted yet.
 ## Host tooling (`install.sh`)
 
 On Debian or Ubuntu, `install.sh` installs host PHP versions with a switcher,
-Composer, WP-CLI, Node through nvm and the starship prompt.
+Composer, WP-CLI, Node through nvm, git, the GitHub CLI and the starship prompt.
 
 ```bash
 sudo ./install.sh                                # everything; PHP 8.3 default
@@ -122,25 +122,36 @@ sudo ./install.sh --versions 8.1 8.2 8.3 --default 8.2
 sudo ./install.sh --versions=8.2,8.3,8.4         # comma-separated works too
 ```
 
-`--no-composer`, `--no-wp`, `--no-node` and `--no-starship` skip a part;
-`--node-version 20` pins a Node major instead of the latest LTS. The component
-selectors — `--php`, `--composer`, `--wp`, `--node`, `--starship` — install
-**only** what they name and reinstall something already present, which is how you
-refresh one tool without touching the rest (a Node-only run does no `apt-get
-update` at all). PHP versions always need the `--php` selector, so `--node 8.2`
-is rejected rather than quietly ignored.
+`--no-composer`, `--no-wp`, `--no-node`, `--no-git`, `--no-gh` and
+`--no-starship` skip a part; `--node-version 20` pins a Node major instead of the
+latest LTS. The component selectors — `--php`, `--composer`, `--wp`, `--node`,
+`--git`, `--gh`, `--starship` — install **only** what they name and reinstall
+something already present, which is how you refresh one tool without touching the
+rest (a Node-only run does no `apt-get update` at all). PHP versions always need
+the `--php` selector, so `--node 8.2` is rejected rather than quietly ignored.
+
+git and the GitHub CLI are the exception to "install it": they go in **only when
+missing**, so a run never upgrades or reconfigures the ones already on the box.
+`gh` comes from GitHub's own apt repository, since the version Debian and Ubuntu
+ship trails upstream by a long way; if that repository can't be reached the
+distro package is used instead. Naming `--git` or `--gh` installs regardless.
 
 ```bash
 sudo ./install.sh --node                # reinstall just Node via nvm
+sudo ./install.sh --gh                  # (re)install the GitHub CLI on its own
 sudo ./install.sh --starship            # reinstall the prompt and reset its config
 sudo ./install.sh --php 8.2 8.3         # add these PHP versions
 ```
 
 The same selectors work after `--uninstall`; `--php` without versions removes
 every PHP version the script can find, removing Node also removes nvm and its
-Node versions for the invoking user, and a bare `sudo ./install.sh --uninstall`
-takes out everything it manages, `phpsw` included. Afterwards `phpsw` lists the
-installed host versions and `sudo phpsw 8.2` switches the CLI and FPM default.
+Node versions for the invoking user, removing `gh` takes its apt repository and
+key with it, and a bare `sudo ./install.sh --uninstall` takes out everything it
+manages, `phpsw` included. git is the one thing it won't remove — `git.sh`, the
+worktree helpers and the agent workflow all run on it, and apt would pull its
+dependents out too, so `--uninstall --git` says so and leaves it alone.
+Afterwards `phpsw` lists the installed host versions and `sudo phpsw 8.2`
+switches the CLI and FPM default.
 
 **The Claude Code CLI, its MCP servers and its plugins are not installed here.**
 They live in the `llm-infrastructure` repo alongside the agent workflow — run its
