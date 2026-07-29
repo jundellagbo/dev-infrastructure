@@ -1,6 +1,40 @@
 # Git shortcuts, the branch prompt and the worktree helpers.
 #
-# Self-contained: source this file directly. install.sh wires it into ~/.bashrc.
+# Source this file directly; install.sh wires it into the rc files the user's
+# shell actually reads. It runs under bash on Linux, WSL, macOS and Git Bash,
+# and under zsh - which is the macOS default login shell, so a bash-only file
+# here would mean a Mac with no prompt and no worktree helpers.
+#
+# Anything that differs per platform comes from platforms/platform.sh next to
+# this file: docker's argument mangling under MSYS, how to escalate, how to read
+# a file's timestamp. Its names are all infra_*/platform_*/INFRA_*, so nothing
+# it defines can collide with something a user might type at this prompt.
+
+# Which shell is reading this. Both are supported; the differences are the
+# prompt hook, the keybinding builtin and array syntax, all near the bottom.
+if [ -n "${ZSH_VERSION:-}" ]; then
+    INFRA_SHELL=zsh
+else
+    INFRA_SHELL=bash
+fi
+
+# This file's own directory. In bash that is BASH_SOURCE; in zsh a sourced
+# file's $0 is the file itself, which is why this needs no zsh-only expansion
+# (one would be a parse error in bash, whether or not the branch ever runs).
+if [ -n "${BASH_SOURCE:-}" ]; then
+    _INFRA_GIT_SH="${BASH_SOURCE[0]}"
+else
+    _INFRA_GIT_SH="$0"
+fi
+_INFRA_GIT_SH="$(cd "$(dirname "$_INFRA_GIT_SH")" && pwd)/$(basename "$_INFRA_GIT_SH")"
+
+# Optional: a checkout that only has git.sh still gets every alias and helper,
+# it just falls back to plain docker and plain sudo.
+if [ -r "$(dirname "$_INFRA_GIT_SH")/platforms/platform.sh" ]; then
+    . "$(dirname "$_INFRA_GIT_SH")/platforms/platform.sh"
+else
+    platform_docker() { docker "$@"; }
+fi
 
 # Commit
 alias gcom='git commit -m'
@@ -173,6 +207,9 @@ _gwt_compose_project() {
   printf '%s\n' "${name//[^a-z0-9_-]/}"
 }
 
+# platform_docker, not docker: under MSYS every argument that looks like a Unix
+# path is rewritten to a Windows one before docker sees it, which turns a label
+# filter into nonsense and silently matches nothing.
 _gwt_docker_cleanup() {
   local path="$1" proj file ids
   command -v docker >/dev/null 2>&1 || return 0
@@ -181,20 +218,33 @@ _gwt_docker_cleanup() {
   for file in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
     if [ -f "${path}/${file}" ]; then
       echo "docker compose down (${proj})"
-      ( cd "$path" && docker compose -f "$file" -p "$proj" down --volumes --rmi local --remove-orphans )
+      ( cd "$path" && platform_docker compose -f "$file" -p "$proj" down --volumes --rmi local --remove-orphans )
       break
     fi
   done
 
-  # Sweep anything compose left behind (orphans from renamed/removed services)
-  ids="$(docker ps -aq --filter "label=com.docker.compose.project=${proj}" 2>/dev/null)"
-  [ -n "$ids" ] && docker rm -f $ids >/dev/null
-  ids="$(docker volume ls -q --filter "label=com.docker.compose.project=${proj}" 2>/dev/null)"
-  [ -n "$ids" ] && docker volume rm -f $ids >/dev/null
-  ids="$(docker images -q --filter "label=com.docker.compose.project=${proj}" 2>/dev/null)"
-  [ -n "$ids" ] && docker rmi -f $ids >/dev/null
-  ids="$(docker network ls -q --filter "label=com.docker.compose.project=${proj}" 2>/dev/null)"
-  [ -n "$ids" ] && docker network rm $ids >/dev/null 2>&1
+  # Sweep anything compose left behind (orphans from renamed/removed services).
+  #
+  # One id per invocation rather than splatting an unquoted "$ids" onto the
+  # command line: zsh does not word-split unquoted expansions the way bash does,
+  # so a multi-line list would arrive as a single argument and match nothing.
+  local label="label=com.docker.compose.project=${proj}"
+  _gwt_docker_each "$(platform_docker ps -aq --filter "$label" 2>/dev/null)"        rm -f
+  _gwt_docker_each "$(platform_docker volume ls -q --filter "$label" 2>/dev/null)"  volume rm -f
+  _gwt_docker_each "$(platform_docker images -q --filter "$label" 2>/dev/null)"     rmi -f
+  _gwt_docker_each "$(platform_docker network ls -q --filter "$label" 2>/dev/null)" network rm
+  return 0
+}
+
+# Run "docker <args...> <id>" once per id in a newline-separated list. Best
+# effort throughout: an id another sweep already removed is not an error.
+_gwt_docker_each() {
+  local ids="$1" id
+  shift
+  [ -n "$ids" ] || return 0
+  printf '%s\n' "$ids" | while IFS= read -r id; do
+    [ -n "$id" ] && platform_docker "$@" "$id" >/dev/null 2>&1
+  done
   return 0
 }
 
@@ -222,6 +272,12 @@ _gwt_rm_tree() {
       sudo rm -rf "$path"
       [ -e "$path" ] || return 0
     fi
+  else
+    # No sudo at all: on Git Bash what blocks a delete is usually a file another
+    # process still has open - an editor, a running container - rather than an
+    # owner this shell can't beat, so escalating would not have helped anyway.
+    echo "could not remove $path - close anything using it, or delete it as Administrator" >&2
+    return 1
   fi
 
   echo "could not remove $path (permission denied) - remove it manually: sudo rm -rf '$path'" >&2
@@ -328,8 +384,11 @@ _gwtrm() {
   fi
 
   if [ $assume_yes -eq 0 ]; then
+    # printf then a bare read: -p is bash's spelling and zsh wants
+    # `read "reply?prompt"` instead, so neither shell's version is portable.
     local reply
-    read -r -p "proceed? [y/N] " reply
+    printf 'proceed? [y/N] '
+    read -r reply
     case "$reply" in [yY]|[yY][eE][sS]) ;; *) echo "aborted"; return 1 ;; esac
   fi
 
@@ -413,46 +472,64 @@ alias gwho='git shortlog -s --'
 # Project tooling
 alias sail='./vendor/bin/sail'
 
-# Git branch in PS1 - the fallback prompt, used when starship isn't installed
+# Git branch in the prompt - the fallback, used when starship isn't installed.
+#
+# The accumulator is `state`, not `status`: in zsh `status` is a special
+# parameter tied to $?, so a local of that name is at best meaningless and at
+# worst an error every time the prompt draws.
 git_branch() {
-  local branch status=""
+  local branch state=""
 
   branch=$(git branch --show-current 2>/dev/null) || return
 
   # Staged changes
-  git diff --cached --quiet 2>/dev/null || status+="+"
+  git diff --cached --quiet 2>/dev/null || state="${state}+"
 
   # Unstaged changes
-  git diff --quiet 2>/dev/null || status+="*"
+  git diff --quiet 2>/dev/null || state="${state}*"
 
   # Untracked files
-  [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ] && status+="?"
+  [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ] && state="${state}?"
 
   # Merge conflicts
-  [ -n "$(git diff --name-only --diff-filter=U 2>/dev/null)" ] && status+="x"
+  [ -n "$(git diff --name-only --diff-filter=U 2>/dev/null)" ] && state="${state}x"
 
   # Clean repo
-  [ -z "$status" ] && status="✓"
+  [ -z "$state" ] && state="✓"
 
-  echo " ($branch:$status)"
+  echo " ($branch:$state)"
 }
 
-# The prompt: starship when it is installed (install.sh puts it in
-# /usr/local/bin and writes the config), the hand-rolled PS1 otherwise. Both
-# show the same thing - current directory and branch - so a machine without
-# starship is not a machine with a worse prompt, and neither half of this
-# depends on the other being there.
+# Is this an interactive shell? Both shells put i in $-, and both are asked the
+# same way here so the prompt work is skipped identically in a script.
+_infra_interactive() { case "$-" in *i*) return 0 ;; *) return 1 ;; esac; }
+
+# Is starship already running in this shell? A login shell may have had it
+# started by the machine-wide /etc/profile.d/starship.sh install.sh drops, and a
+# second `starship init` would double-wrap the prompt hook.
+_infra_starship_up() {
+  if [ "$INFRA_SHELL" = zsh ]; then
+    [ -n "${STARSHIP_SESSION_KEY:-}" ]
+  else
+    declare -F starship_precmd >/dev/null 2>&1
+  fi
+}
+
+# The prompt: starship when it is installed (install.sh puts it on PATH and
+# writes the config), the hand-rolled fallback otherwise. Both show the same
+# thing - current directory and branch - so a machine without starship is not a
+# machine with a worse prompt, and neither half depends on the other.
 #
-# Interactive shells only: a script that sources this file has no prompt to
-# draw, and `starship init` costs a subprocess to produce one nobody sees.
-#
-# Idempotent: a login shell may have already had starship initialised by the
-# machine-wide /etc/profile.d/starship.sh install.sh drops, and re-running
-# `starship init` would double-wrap PROMPT_COMMAND. starship_precmd existing
-# means it is already up, so only init when it isn't.
-if [ "${-#*i}" != "$-" ]; then
+# The fallback prompt is written twice because the escape syntax is genuinely
+# different: bash uses \u\h\w and brackets non-printing runs with \[ \], zsh
+# uses %n%m%~ and %{ %}. Sharing one string would render the other's escapes
+# literally.
+if _infra_interactive; then
   if command -v starship >/dev/null 2>&1; then
-    declare -F starship_precmd >/dev/null 2>&1 || eval "$(starship init bash)"
+    _infra_starship_up || eval "$(starship init "$INFRA_SHELL")"
+  elif [ "$INFRA_SHELL" = zsh ]; then
+    setopt PROMPT_SUBST 2>/dev/null
+    PS1='%{%F{green}%}%n@%m%{%f%}:%{%F{blue}%}%~%{%F{yellow}%}$(git_branch)%{%f%}$ '
   else
     PS1='\[\e[32m\]\u@\h\[\e[0m\]:\[\e[34m\]\w\[\e[33m\]$(git_branch)\[\e[0m\]\$ '
   fi
@@ -471,14 +548,18 @@ fi
 # other, so each watches its own and the names are kept apart deliberately -
 # infra-reload over there is llm.sh's, and defining it here again would just
 # shadow whichever loaded first.
-_INFRA_GIT_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+#
+# _INFRA_GIT_SH is resolved at the top of this file, where both shells can be
+# asked for it in a way the other can still parse.
 
 # Sub-second precision, and whole seconds are not enough: two changes in the same
 # second read as one stamp, and since the stamp is only refreshed on reload, a
 # change landing in the same second as the last one compares equal forever - the
-# edit is missed permanently, not just until the next prompt. GNU's %.9Y and
-# BSD's %Fm both carry the fraction; ls does not, so that fallback keeps the old
-# coarse behaviour.
+# edit is missed permanently, not just until the next prompt.
+#
+# GNU stat's %.9Y is Linux, WSL and Git Bash (whose coreutils are GNU); BSD
+# stat's %Fm is macOS. Both carry the fraction. ls does not, so the last
+# fallback - a system with neither - keeps the coarse whole-second behaviour.
 _infra_git_stamp() {
   stat -c %.9Y "$_INFRA_GIT_SH" 2>/dev/null \
     || stat -f %Fm "$_INFRA_GIT_SH" 2>/dev/null \
@@ -509,7 +590,7 @@ _infra_git_reload_if_changed() {
 # every other open terminal reloads at its next prompt.
 infra-git-reload() {
   . "$_INFRA_GIT_SH" && printf '  reloaded %s\n' "$_INFRA_GIT_SH"
-  if [ "$1" = "--all" ]; then
+  if [ "${1:-}" = "--all" ]; then
     touch "$_INFRA_GIT_SH" 2>/dev/null
     # After the touch, so this shell doesn't reload itself again on next prompt
     INFRA_GIT_STAMP="$(_infra_git_stamp)"
@@ -517,18 +598,42 @@ infra-git-reload() {
   fi
 }
 
+# Register the reload hook with whatever this shell calls its pre-prompt hook.
+# Both shells have one and neither understands the other's: bash runs a string
+# in PROMPT_COMMAND, zsh runs every function named in the precmd_functions
+# array. The zsh branch is eval'd so bash never parses its array syntax.
+#
 # After starship, never before: its init moves any existing PROMPT_COMMAND into
 # STARSHIP_PROMPT_COMMAND and runs it from inside its own precmd, so a hook
 # added first would end up there and the check below would add a second copy.
-# Appending also leaves starship_precmd first, which is where it has to be to
-# read the real exit status.
-if [ "${-#*i}" != "$-" ]; then
-  case ";${PROMPT_COMMAND-};${STARSHIP_PROMPT_COMMAND-};" in
-    *";_infra_git_reload_if_changed;"*) ;;
-    ";;;"|";;") PROMPT_COMMAND="_infra_git_reload_if_changed" ;;
-    *) PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND};}_infra_git_reload_if_changed" ;;
-  esac
+# Appending also leaves starship's own hook first, which is where it has to be
+# to read the real exit status.
+if _infra_interactive; then
+  if [ "$INFRA_SHELL" = zsh ]; then
+    eval '
+      typeset -ag precmd_functions
+      (( ${precmd_functions[(I)_infra_git_reload_if_changed]} )) ||
+        precmd_functions+=(_infra_git_reload_if_changed)
+    '
+  else
+    case ";${PROMPT_COMMAND-};${STARSHIP_PROMPT_COMMAND-};" in
+      *";_infra_git_reload_if_changed;"*) ;;
+      ";;;"|";;") PROMPT_COMMAND="_infra_git_reload_if_changed" ;;
+      *) PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND};}_infra_git_reload_if_changed" ;;
+    esac
+  fi
 fi
 
-bind '"\e[A": history-search-backward'
-bind '"\e[B": history-search-forward'
+# Up/down search the history for what has already been typed rather than walking
+# it blindly. bash binds through readline, zsh through zle - and in a
+# non-interactive shell neither line editor is loaded, so `bind` there prints a
+# warning about line editing not being enabled for no reason at all.
+if _infra_interactive; then
+  if [ "$INFRA_SHELL" = zsh ]; then
+    bindkey '^[[A' history-beginning-search-backward 2>/dev/null
+    bindkey '^[[B' history-beginning-search-forward 2>/dev/null
+  else
+    bind '"\e[A": history-search-backward' 2>/dev/null
+    bind '"\e[B": history-search-forward' 2>/dev/null
+  fi
+fi

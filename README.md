@@ -31,10 +31,14 @@ trust the CA, which Windows needs), optionally point `WWW_PATH` / `NGINX_PATH` i
 and visit `https://mysite.dev.local`.
 
 **Host DNS.** Containers resolve `*.dev.local` themselves; your browser does not.
-On Linux with systemd-resolved, `sudo ./scripts/setup-host-dns.sh` installs a
-persistent wildcard resolver pointing at `127.0.0.1`, so new virtual hosts need
-no hosts-file entry. Elsewhere, add one hosts line per site — hosts files don't
-support wildcards.
+`sudo ./scripts/setup-host-dns.sh` installs a persistent wildcard resolver
+pointing at `127.0.0.1`, so new virtual hosts need no hosts-file entry: a dnsmasq
+under systemd on Linux and WSL, or under launchd with an `/etc/resolver` stub on
+macOS. Windows has no per-suffix resolver at all, so there `project-create.sh`
+writes one hosts line per site — hosts files don't support wildcards. Under WSL
+the resolver serves the distro; your Windows browser still needs its own hosts
+entry, and `/etc/wsl.conf` needs `generateHosts=false` or WSL rewrites the file
+on every boot. The script says all of this on the platform you run it on.
 
 **Automatic virtual hosts.** Any directory named `www/<name>.dev.local/public` is
 served at `https://<name>.dev.local` with no Nginx config and no reload. Files in
@@ -90,16 +94,17 @@ docker compose exec php wp --path=/var/www/myblog/public core install \
 **Layout.** `docker/` holds the PHP and Apache images and vhosts, `nginx/` the
 virtual host configs (default `NGINX_PATH`), `www/` the projects (default
 `WWW_PATH`), `ssl/` the wildcard certificates, `mysql/` and `postgresql/` their
-init scripts, and `scripts/` the helpers.
+init scripts, `scripts/` the helpers and `platforms/` the per-OS layer they run
+on (see [Environments](#environments)).
 
-**SSL.** The certificate covers `*.dev.local`, `dev.local` and `localhost`. On
-Windows, open `\\wsl$\Ubuntu\home\<you>\infra\ssl`, double-click `ca.crt` →
-Install Certificate → Local Machine → Trusted Root Certification Authorities,
-then restart the browser. Or in an elevated PowerShell:
-
-```powershell
-Import-Certificate -FilePath "\\wsl$\Ubuntu\home\<you>\infra\ssl\ca.crt" -CertStoreLocation Cert:\LocalMachine\Root
-```
+**SSL.** The certificate covers `*.dev.local`, `dev.local` and `localhost`.
+`./scripts/generate-ssl.sh` prints how to trust the CA **on the platform you ran
+it from**, with the real path filled in — `update-ca-certificates` on Linux,
+`security add-trusted-cert` on macOS, `Import-Certificate` against
+`Cert:\LocalMachine\Root` on Windows, and both halves under WSL, where the
+Windows browser checks a different store from the one `curl` inside the distro
+does. Firefox keeps its own store everywhere. Restart the browser afterwards:
+trust decisions are cached.
 
 **Troubleshooting.** A port already in use: `sudo lsof -i :80`, then stop that
 process or change the port in `docker-compose.yml`. Permission trouble in the
@@ -121,6 +126,25 @@ sudo ./install.sh                                # everything; PHP 8.3 default
 sudo ./install.sh --versions 8.1 8.2 8.3 --default 8.2
 sudo ./install.sh --versions=8.2,8.3,8.4         # comma-separated works too
 ```
+
+It runs on the other platforms too, doing what each can and saying what it
+can't rather than failing partway through:
+
+| | Debian/Ubuntu (incl. WSL) | macOS | Git Bash / MSYS2 | other Linux |
+|---|---|---|---|---|
+| PHP + `phpsw` | yes | `brew install php@8.3` | Docker stack | needs ondrej PPA |
+| Composer, WP-CLI | yes | yes, given a `php` | yes, given a `php` | yes |
+| Node via nvm | yes | yes | nvm-windows (`.exe`) | yes |
+| git, `gh` | apt | brew | bundled / winget | your package manager |
+| starship + shell wiring | yes | yes | yes | yes |
+| installs into | `/usr/local/bin`, sudo | `~/.local/bin`, **no** sudo | `~/.local/bin`, no sudo | `/usr/local/bin`, sudo |
+
+Run it **without** `sudo` on macOS and Git Bash — Homebrew refuses to work as
+root, and it will stop and tell you so rather than scattering root-owned files
+through your home directory. The shell wiring goes to the files your shell
+actually reads: `~/.bashrc`, plus `~/.bash_profile` on macOS (where Terminal
+opens a login shell that never reads `.bashrc`), or `~/.zshrc` when zsh is your
+login shell.
 
 `--no-composer`, `--no-wp`, `--no-node`, `--no-git`, `--no-gh` and
 `--no-starship` skip a part; `--node-version 20` pins a Node major instead of the
@@ -261,10 +285,45 @@ the confirmation.
 
 ### Environments
 
-Linux, macOS and Windows via WSL. Every script is pinned to `#!/bin/bash`, which
-exists on all three — and because that is bash 3.2 on macOS, nothing here uses
-bash 4 syntax or steps outside a stock BSD userland (no `md5sum`, no
-argument-less `mktemp`, no GNU-only flags). `.gitattributes` forces LF endings so
-a Windows checkout can't hand a script a `\r` in the shebang. Only `git` and the
-usual POSIX text tools are required; `docker` is needed for the stack and the
-worktree teardown, and `gh` is optional.
+Five platforms: **Linux**, **WSL**, **macOS**, **MSYS2/Cygwin on Windows** and
+**Git Bash**. Everything that differs between them lives in `platforms/`, one
+file per platform, rather than in a `case` statement inside each script:
+
+```
+platforms/platform.sh   detect the platform, load common.sh + that platform's file
+platforms/common.sh     the default answer to every hook, and the shared helpers
+platforms/linux.sh      systemd, apt, /usr/local/bin, sudo
+platforms/wsl.sh        linux.sh + the Windows host that browses and resolves separately
+platforms/macos.sh      launchd, Homebrew, /etc/resolver, zsh, per-user installs
+platforms/windows.sh    Windows' hosts file, no sudo, MSYS path mangling
+platforms/gitbash.sh    windows.sh + git and curl already installed
+```
+
+A script sources `platforms/platform.sh` and calls hooks — `platform_setup_dns`,
+`platform_trust_ca`, `platform_free_ports`, `platform_docker`,
+`platform_hosts_file`, `platform_bin_dir`, `platform_rc_files` — so adding a
+platform means adding one file, not editing seven scripts. `wsl.sh` sources
+`linux.sh` and `gitbash.sh` sources `windows.sh`, so each carries only its own
+deltas. Every name is `infra_*`, `platform_*` or `INFRA_*`: `git.sh` loads this
+into every interactive shell, so nothing may take a name you might type.
+
+What that buys, concretely: `docker exec` gets `MSYS_NO_PATHCONV` under Git Bash
+so container paths aren't rewritten into `C:\Program Files\...`; hosts entries go
+to Windows' real hosts file rather than the MSYS one nothing reads; name
+resolution falls back from `getent` to `dscacheutil` to `ping` where glibc isn't;
+`sed -i` advice gets the empty backup suffix BSD sed demands; colour and the ✓
+glyph turn off on a terminal that can't render them; and `install.sh` puts
+binaries in `/usr/local/bin` under sudo on Linux but `~/.local/bin` without it on
+macOS and Windows, where Homebrew refuses to run as root anyway.
+
+`git.sh` runs under **bash and zsh** — zsh is the macOS default login shell, so a
+bash-only file there means a Mac with no prompt and no worktree helpers. The
+prompt hook (`PROMPT_COMMAND` vs `precmd_functions`), the keybinding builtin
+(`bind` vs `bindkey`) and the prompt escapes are written for both.
+
+Scripts use `#!/usr/bin/env bash` rather than `/bin/bash`, so Homebrew's bash 5
+wins over the bash 3.2 macOS ships — but nothing here needs it: no bash 4 syntax,
+no GNU-only flags, no `md5sum`, no argument-less `mktemp`. `.gitattributes` forces
+LF endings so a Windows checkout can't hand a script a `\r` in the shebang. Only
+`git` and the usual POSIX text tools are required; `docker` is needed for the
+stack and the worktree teardown, and `gh` is optional.

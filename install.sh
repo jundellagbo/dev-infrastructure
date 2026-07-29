@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Install PHP (multiple versions + switcher), Composer, WP-CLI, Node, git, the
 # GitHub CLI and the starship prompt on the host.
@@ -34,21 +34,54 @@
 #   nvm ls         # list installed Node versions
 #   nvm use 20     # switch the active Node version
 #
+# Platforms
+#
+#   Debian/Ubuntu (incl. WSL)  everything, system-wide in /usr/local/bin. Run it
+#                              with sudo; PHP comes from ppa:ondrej/php, which is
+#                              what makes several versions side by side possible.
+#   macOS                      Composer, WP-CLI, Node, git, gh and starship, all
+#                              per-user in ~/.local/bin. Run it WITHOUT sudo -
+#                              Homebrew refuses to work as root. PHP is Homebrew's
+#                              to install (brew install php@8.3); there is no
+#                              phpsw, `brew link` is the switcher.
+#   Git Bash on Windows        Composer, WP-CLI, gh and starship, per-user. Node
+#                              needs nvm-windows, which is an .exe installer.
+#   other Linux                everything except PHP; no other distro ships the
+#                              side-by-side versions this expects.
+#
 # The Claude Code CLI, its MCP servers and its plugins are installed separately:
 # see install.sh in the llm-infrastructure repo.
 
 set -e
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# ------------------------------------------------------------------- platform
 
-print_success() { echo -e "${GREEN}✓ $1${NC}"; }
-print_error() { echo -e "${RED}✗ $1${NC}"; }
-print_info() { echo -e "${BLUE}→ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}! $1${NC}"; }
+# This file is the bootstrap, but it is never alone: it lives in the checkout
+# next to platforms/, so it uses the same platform layer every other script here
+# does rather than repeating the detection.
+INFRA_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -r "${INFRA_DIR}/platforms/platform.sh" ]; then
+    echo "install.sh needs the platforms/ directory next to it - run it from the checkout" >&2
+    exit 1
+fi
+. "${INFRA_DIR}/platforms/platform.sh"
+
+# PHP here means several versions side by side with a switcher, and that rests
+# on ppa:ondrej/php - no other packaging offers it, so PHP is an apt-only
+# component while everything else installs from upstream on any platform.
+HAS_APT=0
+command -v apt-get >/dev/null 2>&1 && HAS_APT=1
+
+# Linux is a shared box and installs system-wide under sudo, as it always has.
+# macOS and the Windows shells are single-user: Homebrew refuses to run as root,
+# an MSYS "Administrator" shell is a different animal, and neither has a
+# /usr/local/bin worth fighting for - so there the install is per-user and sudo
+# never appears.
+if platform_installs_system_wide; then
+    NEEDS_ROOT=1
+else
+    NEEDS_ROOT=0
+fi
 
 PHP_VERSIONS="8.3"
 DEFAULT_VERSION="8.3"
@@ -122,7 +155,7 @@ while [ $# -gt 0 ]; do
             exit 0 ;;
         # Bare version numbers extend the list: "--versions 8.2 8.3 8.4"
         [0-9].[0-9]|[0-9].[0-9][0-9]) add_versions "$1" ;;
-        *) print_error "unknown option: $1"; exit 1 ;;
+        *) infra_err "unknown option: $1"; exit 1 ;;
     esac
     shift
 done
@@ -163,31 +196,125 @@ elif [ "$selector" -eq 1 ]; then
 fi
 
 if [ -n "$picked_versions" ] && [ "$selector" -eq 1 ] && [ "$SEL_PHP" -eq 0 ]; then
-    print_error "PHP versions require the --php selector"
+    infra_err "PHP versions require the --php selector"
     exit 1
 fi
 
 for version in $PHP_VERSIONS; do
     case "$version" in
         [0-9].[0-9]|[0-9].[0-9][0-9]) ;;
-        *) print_error "invalid PHP version: $version"; exit 1 ;;
+        *) infra_err "invalid PHP version: $version"; exit 1 ;;
     esac
 done
 
-if [ "$EUID" -ne 0 ]; then
-    print_error "This script must be run with sudo"
+# ----------------------------------------------------------- platform gating
+
+# Turn off what this platform genuinely cannot do, and say why once rather than
+# failing halfway through with a package-manager error. A component the user
+# asked for by name is worth a warning; one that was only on by default isn't.
+skip_component() {
+    local name="$1" reason="$2" selected="$3"
+    if [ "$selected" -eq 1 ]; then
+        infra_warn "skipping ${name}: ${reason}"
+    fi
+    return 0
+}
+
+if [ $HAS_APT -eq 0 ] && [ $INSTALL_PHP -eq 1 ]; then
+    if [ "$UNINSTALL_MODE" -eq 1 ]; then
+        skip_component PHP "nothing here installs PHP through apt, so there is none to remove" "$SEL_PHP"
+    else
+        case "$INFRA_OS" in
+            macos)   skip_component PHP "install it with Homebrew - brew install php@8.3" "$SEL_PHP" ;;
+            windows|gitbash)
+                     skip_component PHP "no PHP packaging for a Windows shell - use the Docker stack, or php.net's Windows build" "$SEL_PHP" ;;
+            *)       skip_component PHP "side-by-side versions need ppa:ondrej/php, which is Debian/Ubuntu only" "$SEL_PHP" ;;
+        esac
+    fi
+    INSTALL_PHP=0
+    UNINSTALL_PHP=0
+fi
+
+# nvm is a POSIX shell script and has no Windows support at all - nvm-windows is
+# a separate project with its own .exe installer.
+if infra_is_windows && [ $INSTALL_NODE -eq 1 ]; then
+    skip_component Node "nvm has no Windows build - see github.com/coreybutler/nvm-windows" "$SEL_NODE"
+    INSTALL_NODE=0
+    UNINSTALL_NODE=0
+fi
+
+if infra_is_windows && [ $INSTALL_GIT -eq 1 ]; then
+    # A Git Bash prompt exists because git for Windows is already installed.
+    INSTALL_GIT=0
+fi
+
+if [ "$UNINSTALL_MODE" -eq 0 ] && [ $INSTALL_PHP -eq 0 ] && [ $INSTALL_COMPOSER -eq 0 ] \
+   && [ $INSTALL_WPCLI -eq 0 ] && [ $INSTALL_NODE -eq 0 ] && [ $INSTALL_GIT -eq 0 ] \
+   && [ $INSTALL_GH -eq 0 ] && [ $INSTALL_STARSHIP -eq 0 ]; then
+    infra_err "nothing left to install on $(platform_label)"
     exit 1
 fi
 
-if ! command -v apt-get >/dev/null 2>&1; then
-    print_error "This installer targets Debian/Ubuntu (apt-get not found)"
+# --------------------------------------------------------------- privileges
+
+if [ "$NEEDS_ROOT" -eq 1 ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+        infra_err "This script must be run with sudo on $(platform_label)"
+        printf '    sudo %s\n' "$0" >&2
+        exit 1
+    fi
+    if [ $HAS_APT -eq 0 ] && { [ $INSTALL_GIT -eq 1 ] || [ $INSTALL_GH -eq 1 ]; }; then
+        infra_warn "no apt-get here - git and gh have to come from this distro's package manager"
+        INSTALL_GIT=0
+        INSTALL_GH=0
+    fi
+elif [ "$(id -u)" -eq 0 ]; then
+    infra_err "Do not run this with sudo on $(platform_label) - it installs per-user"
+    printf '    %s\n' "$0" >&2
     exit 1
 fi
 
-TOOL_USER="${SUDO_USER:-root}"
-TOOL_HOME="$(getent passwd "$TOOL_USER" | cut -d: -f6)"
-TOOL_HOME="${TOOL_HOME:-$HOME}"
-run_as_user() { su - "$TOOL_USER" -c "$1"; }
+# The user whose home directory and shell this configures. Under sudo that is
+# the human who typed it, not root.
+TOOL_USER="${SUDO_USER:-$(id -un)}"
+
+# getent is glibc's; macOS answers through dscl and neither exists on MSYS, so
+# fall through to tilde expansion, which every shell does.
+home_of() {
+    local user="$1" home=""
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+    [ -n "$home" ] || home="$(dscl . -read "/Users/${user}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+    [ -n "$home" ] || home="$(eval printf '%s' "~${user}" 2>/dev/null)"
+    case "$home" in ''|'~'*) return 1 ;; esac
+    printf '%s\n' "$home"
+}
+TOOL_HOME="$(home_of "$TOOL_USER" || printf '%s' "$HOME")"
+
+login_shell_of() {
+    local user="$1" shell=""
+    shell="$(getent passwd "$user" 2>/dev/null | cut -d: -f7)"
+    [ -n "$shell" ] || shell="$(dscl . -read "/Users/${user}" UserShell 2>/dev/null | awk '{print $2}')"
+    [ -n "$shell" ] || shell="${SHELL:-/bin/bash}"
+    printf '%s\n' "$shell"
+}
+TOOL_SHELL="$(basename "$(login_shell_of "$TOOL_USER")")"
+
+# Run something as the target user with their profile loaded. Under sudo that
+# means dropping privileges; when already running as them it just means a login
+# shell, so nvm and friends see the same environment either way.
+run_as_user() {
+    if [ "$NEEDS_ROOT" -eq 1 ] && [ "$(id -un)" != "$TOOL_USER" ]; then
+        su - "$TOOL_USER" -c "$1"
+    else
+        bash -lc "$1"
+    fi
+}
+
+# Where binaries land: /usr/local/bin where the install is system-wide, the
+# per-user ~/.local/bin otherwise. The target home is passed in because under
+# sudo $HOME is root's and these tools belong to the human who typed it.
+BIN_DIR="$(platform_bin_dir "$TOOL_HOME")"
+mkdir -p "$BIN_DIR"
 
 # --------------------------------------------------------------- uninstall PHP
 
@@ -199,68 +326,80 @@ if [ "$UNINSTALL_MODE" -eq 1 ]; then
         fi
 
         if [ -z "$PHP_VERSIONS" ]; then
-            print_warning "No PHP versions are installed"
+            infra_warn "No PHP versions are installed"
         fi
 
     for version in $PHP_VERSIONS; do
-        print_info "Uninstalling PHP ${version}..."
+        infra_info "Uninstalling PHP ${version}..."
         pkgs="$(dpkg-query -W -f='${Package}\n' 2>/dev/null | awk -v prefix="php${version}" '
             $0 == prefix || index($0, prefix "-") == 1
         ')"
 
         if [ -z "$pkgs" ]; then
-            print_warning "PHP ${version} is not installed - skipping"
+            infra_warn "PHP ${version} is not installed - skipping"
             continue
         fi
 
         # shellcheck disable=SC2086
         apt-get purge -y -qq $pkgs >/dev/null
-        print_success "PHP ${version} uninstalled"
+        infra_ok "PHP ${version} uninstalled"
     done
 
     remaining="$(ls -1 /usr/bin/php[0-9].[0-9] 2>/dev/null | sed 's#.*/php##' | sort -V)"
     if [ -n "$remaining" ]; then
         fallback="$(printf '%s\n' "$remaining" | tail -1)"
-        if [ -x /usr/local/bin/phpsw ]; then
-            print_info "Switching the default to remaining PHP ${fallback}..."
-            /usr/local/bin/phpsw "$fallback"
+        if [ -x "${BIN_DIR}/phpsw" ]; then
+            infra_info "Switching the default to remaining PHP ${fallback}..."
+            "${BIN_DIR}/phpsw" "$fallback"
         fi
-        print_info "Remaining PHP versions: $(printf '%s\n' "$remaining" | tr '\n' ' ')"
+        infra_info "Remaining PHP versions: $(printf '%s\n' "$remaining" | tr '\n' ' ')"
     else
-        print_warning "No PHP versions remain installed"
+        infra_warn "No PHP versions remain installed"
     fi
     fi
 
     if [ "$UNINSTALL_COMPOSER" -eq 1 ]; then
-        print_info "Uninstalling Composer..."
-        rm -f /usr/local/bin/composer /etc/profile.d/composer.sh
-        print_success "Composer uninstalled"
+        infra_info "Uninstalling Composer..."
+        rm -f "${BIN_DIR}/composer"
+        if [ "$NEEDS_ROOT" -eq 1 ]; then
+            rm -f /etc/profile.d/composer.sh
+        fi
+        infra_ok "Composer uninstalled"
     fi
 
     if [ "$UNINSTALL_WPCLI" -eq 1 ]; then
-        print_info "Uninstalling WP-CLI..."
-        rm -f /usr/local/bin/wp /usr/local/bin/wp-cli.phar
-        print_success "WP-CLI uninstalled"
+        infra_info "Uninstalling WP-CLI..."
+        rm -f "${BIN_DIR}/wp" "${BIN_DIR}/wp-cli.phar"
+        infra_ok "WP-CLI uninstalled"
     fi
 
     if [ "$UNINSTALL_NODE" -eq 1 ]; then
-        print_info "Uninstalling Node and nvm for ${TOOL_USER}..."
+        infra_info "Uninstalling Node and nvm for ${TOOL_USER}..."
         rm -rf "${TOOL_HOME}/.nvm"
-        print_success "Node and nvm uninstalled"
+        infra_ok "Node and nvm uninstalled"
     fi
 
     if [ "$UNINSTALL_GH" -eq 1 ]; then
-        if command -v gh >/dev/null 2>&1 || [ -f /etc/apt/sources.list.d/github-cli.list ]; then
-            print_info "Uninstalling the GitHub CLI..."
+        if [ $HAS_APT -eq 1 ] && { command -v gh >/dev/null 2>&1 || [ -f /etc/apt/sources.list.d/github-cli.list ]; }; then
+            infra_info "Uninstalling the GitHub CLI..."
             apt-get purge -y -qq gh >/dev/null 2>&1 || true
             # The repo and its key are ours, so they go with the package - left
             # behind they keep showing up in every future apt update.
             rm -f /etc/apt/sources.list.d/github-cli.list \
                   /etc/apt/keyrings/githubcli-archive-keyring.gpg
             apt-get update -qq >/dev/null 2>&1 || true
-            print_success "gh uninstalled"
+            infra_ok "gh uninstalled"
+        elif command -v gh >/dev/null 2>&1; then
+            # Installed by something this script doesn't own (brew, winget,
+            # scoop) - removing it is that tool's job, not ours.
+            infra_warn "gh came from another package manager - remove it there:"
+            case "$INFRA_OS" in
+                macos)           printf '    brew uninstall gh\n' ;;
+                windows|gitbash) printf '    winget uninstall GitHub.cli\n' ;;
+                *)               printf '    (your distro package manager)\n' ;;
+            esac
         else
-            print_warning "gh is not installed - skipping"
+            infra_warn "gh is not installed - skipping"
         fi
     fi
 
@@ -269,24 +408,26 @@ if [ "$UNINSTALL_MODE" -eq 1 ]; then
         # declined: git.sh, the worktree helpers and this repo's whole agent
         # workflow run on git, and apt would take every package depending on it
         # along too. Removing it is a decision for a human at a prompt.
-        print_warning "not uninstalling git - git.sh, the worktree helpers and the"
-        print_warning "  agent workflow all need it, and apt would pull its dependents"
-        print_warning "  out with it. Remove it by hand if you really mean to:"
-        print_warning "  sudo apt-get purge git"
+        infra_warn "not uninstalling git - git.sh, the worktree helpers and the"
+        infra_warn "  agent workflow all need it, and its package manager would pull"
+        infra_warn "  its dependents out with it. Remove it by hand if you mean to."
     fi
 
     if [ "$UNINSTALL_STARSHIP" -eq 1 ]; then
-        print_info "Uninstalling starship..."
-        rm -f /usr/local/bin/starship
+        infra_info "Uninstalling starship..."
+        rm -f "${BIN_DIR}/starship"
         # Only the config this script wrote - one the user edited or brought
         # themselves loses the marker line and is theirs to keep.
         starship_toml="${TOOL_HOME}/.config/starship.toml"
         if [ -f "$starship_toml" ] && grep -q '^# managed by infra install.sh' "$starship_toml"; then
             rm -f "$starship_toml"
-            print_info "removed the generated ${starship_toml}"
+            infra_info "removed the generated ${starship_toml}"
         fi
-        # The machine-wide init drop-in is always ours - drop it too.
-        rm -f /etc/profile.d/starship.sh
+        # The machine-wide init drop-in is always ours - drop it too. It only
+        # ever exists where there is an /etc/profile.d to drop it into.
+        if [ "$NEEDS_ROOT" -eq 1 ]; then
+            rm -f /etc/profile.d/starship.sh
+        fi
         # And the statusLine script + its settings entry, when the entry is ours.
         rm -f "${TOOL_HOME}/.config/starship-statusline.sh"
         claude_settings="${TOOL_HOME}/.claude/settings.json"
@@ -298,21 +439,21 @@ if [ "$UNINSTALL_MODE" -eq 1 ]; then
                     if jq 'del(.statusLine)' "$claude_settings" > "$tmp" 2>/dev/null; then
                         mv "$tmp" "$claude_settings"
                         chown "$TOOL_USER" "$claude_settings" 2>/dev/null || true
-                        print_info "removed the starship statusLine from ${claude_settings}"
+                        infra_info "removed the starship statusLine from ${claude_settings}"
                     else
                         rm -f "$tmp"
                     fi ;;
             esac
         fi
-        print_success "starship uninstalled - git.sh falls back to its own prompt"
+        infra_ok "starship uninstalled - git.sh falls back to its own prompt"
     fi
 
     if [ "$UNINSTALL_ALL" -eq 1 ]; then
-        rm -f /usr/local/bin/phpsw
-        print_success "phpsw uninstalled"
+        rm -f "${BIN_DIR}/phpsw"
+        infra_ok "phpsw uninstalled"
     fi
 
-    print_success "Uninstall complete"
+    infra_ok "Uninstall complete"
     exit 0
 fi
 
@@ -324,7 +465,9 @@ esac
 
 export DEBIAN_FRONTEND=noninteractive
 
-print_info "PHP versions: ${PHP_VERSIONS} (default ${DEFAULT_VERSION})"
+if [ $INSTALL_PHP -eq 1 ]; then
+    infra_info "PHP versions: ${PHP_VERSIONS} (default ${DEFAULT_VERSION})"
+fi
 
 # Extensions every Laravel app needs, plus the WordPress/dev extras.
 # Laravel requires ctype, curl, dom, fileinfo, filter, hash, mbstring, openssl,
@@ -378,9 +521,9 @@ fi
 # The full prerequisite set is only needed by the apt-installed components.
 # Selecting just a per-user tool (--node) shouldn't drag an apt update along -
 # that installer only needs curl.
-if [ $INSTALL_PHP -eq 1 ] || [ $INSTALL_COMPOSER -eq 1 ] || [ $INSTALL_WPCLI -eq 1 ] \
-   || [ $git_needed -eq 1 ] || [ $gh_needed -eq 1 ]; then
-    print_info "Installing prerequisites..."
+if [ $HAS_APT -eq 1 ] && { [ $INSTALL_PHP -eq 1 ] || [ $INSTALL_COMPOSER -eq 1 ] \
+   || [ $INSTALL_WPCLI -eq 1 ] || [ $git_needed -eq 1 ] || [ $gh_needed -eq 1 ]; }; then
+    infra_info "Installing prerequisites..."
     apt-get update -qq
     apt-get install -y -qq \
         ca-certificates \
@@ -391,24 +534,35 @@ if [ $INSTALL_PHP -eq 1 ] || [ $INSTALL_COMPOSER -eq 1 ] || [ $INSTALL_WPCLI -eq
         curl \
         unzip \
         git >/dev/null
-    print_success "Prerequisites installed"
+    infra_ok "Prerequisites installed"
 elif ! command -v curl >/dev/null 2>&1; then
-    print_info "Installing curl..."
-    apt-get update -qq
-    apt-get install -y -qq ca-certificates curl >/dev/null
-    print_success "curl installed"
+    if [ $HAS_APT -eq 1 ]; then
+        infra_info "Installing curl..."
+        apt-get update -qq
+        apt-get install -y -qq ca-certificates curl >/dev/null
+        infra_ok "curl installed"
+    else
+        # Every remaining installer here is "curl a script and run it".
+        infra_err "curl is required and not installed"
+        case "$INFRA_OS" in
+            macos)           printf '    xcode-select --install\n' >&2 ;;
+            windows|gitbash) printf '    Git for Windows ships curl - reinstall it, or scoop install curl\n' >&2 ;;
+            *)               printf '    install curl with your package manager, then re-run\n' >&2 ;;
+        esac
+        exit 1
+    fi
 fi
 
 if [ $INSTALL_PHP -eq 1 ]; then
     if grep -rqs "ondrej/php" /etc/apt/sources.list.d/ 2>/dev/null; then
-        print_info "ondrej/php repository already present"
+        infra_info "ondrej/php repository already present"
     else
-        print_info "Adding the ondrej/php repository..."
+        infra_info "Adding the ondrej/php repository..."
         add-apt-repository -y ppa:ondrej/php >/dev/null 2>&1 || {
-            print_error "Failed to add ppa:ondrej/php"
+            infra_err "Failed to add ppa:ondrej/php"
             exit 1
         }
-        print_success "Repository added"
+        infra_ok "Repository added"
     fi
 
     apt-get update -qq
@@ -425,7 +579,7 @@ packages_for() {
         if apt-cache show "$pkg" >/dev/null 2>&1; then
             available="$available $pkg"
         else
-            print_warning "skipping $pkg (not available)" >&2
+            infra_warn "skipping $pkg (not available)" >&2
         fi
     done
     printf '%s\n' "$available"
@@ -433,22 +587,22 @@ packages_for() {
 
 if [ $INSTALL_PHP -eq 1 ]; then
     for version in $PHP_VERSIONS; do
-        print_info "Installing PHP ${version}..."
+        infra_info "Installing PHP ${version}..."
         pkgs="$(packages_for "$version")"
         if [ -z "$pkgs" ]; then
-            print_error "No packages found for PHP ${version} - skipping"
+            infra_err "No packages found for PHP ${version} - skipping"
             continue
         fi
         # shellcheck disable=SC2086
         apt-get install -y -qq $pkgs >/dev/null || {
-            print_error "PHP ${version} installation failed"
+            infra_err "PHP ${version} installation failed"
             exit 1
         }
         # Xdebug is installed but left off - "phpenmod -v <version> xdebug" turns it on
         if command -v phpdismod >/dev/null 2>&1; then
             phpdismod -v "$version" xdebug >/dev/null 2>&1 || true
         fi
-        print_success "PHP ${version} installed"
+        infra_ok "PHP ${version} installed"
     done
 fi
 
@@ -458,9 +612,9 @@ fi
 # The heredoc below is left unindented on purpose - it is the script's source.
 if [ $INSTALL_PHP -eq 1 ]; then
 
-print_info "Installing the phpsw version switcher..."
-cat > /usr/local/bin/phpsw << 'SWITCHER'
-#!/bin/bash
+infra_info "Installing the phpsw version switcher..."
+cat > "${BIN_DIR}/phpsw" << 'SWITCHER'
+#!/usr/bin/env bash
 #
 # Switch the default PHP version (CLI + FPM).
 #
@@ -469,23 +623,24 @@ cat > /usr/local/bin/phpsw << 'SWITCHER'
 
 set -e
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; BLUE=''; NC=''
+fi
 
 installed_versions() {
     ls -1 /usr/bin/php[0-9].[0-9] 2>/dev/null | sed 's#.*/php##' | sort -V
 }
 
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
     current="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)"
     echo "installed PHP versions:"
     for v in $(installed_versions); do
         if [ "$v" = "$current" ]; then
-            echo -e "  ${GREEN}* ${v}${NC}"
+            printf '%b  * %s%b\n' "$GREEN" "$v" "$NC"
         else
-            echo "    ${v}"
+            printf '    %s\n' "$v"
         fi
     done
     echo ""
@@ -495,12 +650,12 @@ fi
 
 version="$1"
 if [ ! -x "/usr/bin/php${version}" ]; then
-    echo -e "${RED}✗ PHP ${version} is not installed${NC}" >&2
+    printf '%b%s%b\n' "$RED" "x PHP ${version} is not installed" "$NC" >&2
     echo "installed: $(installed_versions | tr '\n' ' ')" >&2
     exit 1
 fi
 
-if [ "$EUID" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
 
@@ -523,65 +678,90 @@ if command -v systemctl >/dev/null 2>&1; then
             systemctl disable --now "$service" >/dev/null 2>&1 || true
         fi
     done
+else
+    # WSL without systemd: no unit to enable, so drive the init script directly.
+    for v in $(installed_versions); do
+        [ -x "/etc/init.d/php${v}-fpm" ] || continue
+        if [ "$v" = "$version" ]; then
+            "/etc/init.d/php${v}-fpm" restart >/dev/null 2>&1 || true
+        else
+            "/etc/init.d/php${v}-fpm" stop >/dev/null 2>&1 || true
+        fi
+    done
 fi
 
-echo -e "${GREEN}✓ now using $(php -v | head -1)${NC}"
-echo -e "${BLUE}→ fpm socket: /run/php/php${version}-fpm.sock${NC}"
+printf '%b%s%b\n' "$GREEN" "* now using $(php -v | head -1)" "$NC"
+printf '%b%s%b\n' "$BLUE" "> fpm socket: /run/php/php${version}-fpm.sock" "$NC"
 SWITCHER
-chmod +x /usr/local/bin/phpsw
-print_success "phpsw installed"
+chmod +x "${BIN_DIR}/phpsw"
+infra_ok "phpsw installed"
 
-print_info "Setting PHP ${DEFAULT_VERSION} as the default..."
-/usr/local/bin/phpsw "$DEFAULT_VERSION"
+infra_info "Setting PHP ${DEFAULT_VERSION} as the default..."
+"${BIN_DIR}/phpsw" "$DEFAULT_VERSION"
 
 fi
 
 # -------------------------------------------------------------------- composer
 
+# Composer and WP-CLI are PHP programs fetched from upstream, so they install
+# the same way everywhere - they just need a php to run under, which on macOS
+# and Windows is not this script's to provide.
+if [ $INSTALL_COMPOSER -eq 1 ] && ! command -v php >/dev/null 2>&1; then
+    skip_component Composer "no php on PATH to run it" "$SEL_COMPOSER"
+    INSTALL_COMPOSER=0
+fi
+
 if [ $INSTALL_COMPOSER -eq 1 ]; then
-    print_info "Installing Composer..."
+    infra_info "Installing Composer..."
     expected="$(curl -fsSL https://composer.github.io/installer.sig)"
     tmp="$(mktemp -d)"
     curl -fsSL https://getcomposer.org/installer -o "${tmp}/composer-setup.php"
     actual="$(php -r "echo hash_file('sha384', '${tmp}/composer-setup.php');")"
     if [ "$expected" != "$actual" ]; then
         rm -rf "$tmp"
-        print_error "Composer installer checksum mismatch - aborting"
+        infra_err "Composer installer checksum mismatch - aborting"
         exit 1
     fi
-    php "${tmp}/composer-setup.php" --quiet --install-dir=/usr/local/bin --filename=composer
+    php "${tmp}/composer-setup.php" --quiet --install-dir="$BIN_DIR" --filename=composer
     rm -rf "$tmp"
 
-    # Composer refuses to run plugins/scripts as root without this; dev box, so allow it
-    cat > /etc/profile.d/composer.sh << 'EOF'
+    if [ "$NEEDS_ROOT" -eq 1 ]; then
+        # Composer refuses to run plugins/scripts as root without this; dev box, so allow it
+        cat > /etc/profile.d/composer.sh << 'EOF'
 export COMPOSER_ALLOW_SUPERUSER=1
 export PATH="$PATH:$HOME/.config/composer/vendor/bin:$HOME/.composer/vendor/bin"
 EOF
-    chmod 644 /etc/profile.d/composer.sh
-    print_success "Composer installed"
+        chmod 644 /etc/profile.d/composer.sh
+    fi
+    infra_ok "Composer installed"
 fi
 
 # ---------------------------------------------------------------------- wp-cli
 
+if [ $INSTALL_WPCLI -eq 1 ] && ! command -v php >/dev/null 2>&1; then
+    skip_component WP-CLI "no php on PATH to run it" "$SEL_WPCLI"
+    INSTALL_WPCLI=0
+fi
+
 if [ $INSTALL_WPCLI -eq 1 ]; then
-    print_info "Installing WP-CLI..."
+    infra_info "Installing WP-CLI..."
     curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
-        -o /usr/local/bin/wp-cli.phar
-    chmod +x /usr/local/bin/wp-cli.phar
+        -o "${BIN_DIR}/wp-cli.phar"
+    chmod +x "${BIN_DIR}/wp-cli.phar"
 
     # Wrapper so root doesn't have to remember --allow-root every single time
-    cat > /usr/local/bin/wp << 'EOF'
-#!/bin/bash
-if [ "$EUID" -eq 0 ]; then
-    case " $* " in
+    cat > "${BIN_DIR}/wp" << EOF
+#!/usr/bin/env bash
+if [ "\$(id -u)" -eq 0 ]; then
+    case " \$* " in
         *" --allow-root "*) ;;
-        *) set -- --allow-root "$@" ;;
+        *) set -- --allow-root "\$@" ;;
     esac
 fi
-exec /usr/local/bin/wp-cli.phar "$@"
+exec php "${BIN_DIR}/wp-cli.phar" "\$@"
 EOF
-    chmod +x /usr/local/bin/wp
-    print_success "WP-CLI installed"
+    chmod +x "${BIN_DIR}/wp"
+    infra_ok "WP-CLI installed"
 fi
 
 # ------------------------------------------------------------------- git / gh
@@ -594,20 +774,31 @@ fi
 
 if [ $INSTALL_GIT -eq 1 ]; then
     if command -v git >/dev/null 2>&1 && [ $FORCE_REINSTALL -eq 0 ]; then
-        print_info "git already present ($(git --version 2>/dev/null))"
-    else
-        print_info "Installing git..."
+        infra_info "git already present ($(git --version 2>/dev/null))"
+    elif [ $HAS_APT -eq 1 ]; then
+        infra_info "Installing git..."
         apt-get install -y -qq git >/dev/null 2>&1 \
-            && print_success "git installed ($(git --version 2>/dev/null))" \
-            || print_warning "git install failed - 'apt-get install git' by hand"
+            && infra_ok "git installed ($(git --version 2>/dev/null))" \
+            || infra_warn "git install failed - 'apt-get install git' by hand"
+    elif infra_is_macos; then
+        # Apple ships a git behind the Command Line Tools; Homebrew's is newer.
+        if command -v brew >/dev/null 2>&1; then
+            brew install git >/dev/null 2>&1 \
+                && infra_ok "git installed ($(git --version 2>/dev/null))" \
+                || infra_warn "brew install git failed"
+        else
+            infra_warn "install git with: xcode-select --install (or brew install git)"
+        fi
+    else
+        infra_warn "install git with this platform's package manager"
     fi
 fi
 
 if [ $INSTALL_GH -eq 1 ]; then
     if command -v gh >/dev/null 2>&1 && [ $FORCE_REINSTALL -eq 0 ]; then
-        print_info "gh already present ($(gh --version 2>/dev/null | head -1))"
-    else
-        print_info "Installing the GitHub CLI..."
+        infra_info "gh already present ($(gh --version 2>/dev/null | head -1))"
+    elif [ $HAS_APT -eq 1 ]; then
+        infra_info "Installing the GitHub CLI..."
         # Debian and Ubuntu ship a gh that trails upstream by a long way, so
         # prefer GitHub's own apt repo and keep the distro package as the
         # fallback - an unreachable key or a release the repo doesn't cover
@@ -627,20 +818,32 @@ if [ $INSTALL_GH -eq 1 ]; then
             apt-get update -qq || true
         else
             rm -f "$gh_keyring" "$gh_list"
-            print_warning "could not fetch GitHub's apt key - using the distro gh package"
+            infra_warn "could not fetch GitHub's apt key - using the distro gh package"
         fi
 
         if apt-get install -y -qq gh >/dev/null 2>&1; then
-            print_success "gh installed ($(gh --version 2>/dev/null | head -1))"
+            infra_ok "gh installed ($(gh --version 2>/dev/null | head -1))"
         else
             # The repo is there but unusable for this release - drop it and take
             # whatever gh the distro has rather than leaving the box without one.
             rm -f "$gh_list"
             apt-get update -qq || true
             apt-get install -y -qq gh >/dev/null 2>&1 \
-                && print_success "gh installed from the distro package ($(gh --version 2>/dev/null | head -1))" \
-                || print_warning "gh install failed - see https://cli.github.com"
+                && infra_ok "gh installed from the distro package ($(gh --version 2>/dev/null | head -1))" \
+                || infra_warn "gh install failed - see https://cli.github.com"
         fi
+    elif infra_is_macos && command -v brew >/dev/null 2>&1; then
+        infra_info "Installing the GitHub CLI via Homebrew..."
+        brew install gh >/dev/null 2>&1 \
+            && infra_ok "gh installed ($(gh --version 2>/dev/null | head -1))" \
+            || infra_warn "brew install gh failed - see https://cli.github.com"
+    elif infra_is_windows && command -v winget >/dev/null 2>&1; then
+        infra_info "Installing the GitHub CLI via winget..."
+        winget install --id GitHub.cli --silent --accept-package-agreements >/dev/null 2>&1 \
+            && infra_ok "gh installed - open a new shell to pick it up" \
+            || infra_warn "winget install GitHub.cli failed - see https://cli.github.com"
+    else
+        infra_warn "no package manager for gh here - see https://cli.github.com"
     fi
 fi
 
@@ -651,7 +854,7 @@ fi
 # shell will actually use it.
 
 if [ $INSTALL_NODE -eq 1 ]; then
-    print_info "Installing Node via nvm..."
+    infra_info "Installing Node via nvm..."
 
     # "20" and "--lts" both mean an install target; only "--lts" needs the
     # lts/* alias for a persistent default.
@@ -662,37 +865,46 @@ if [ $INSTALL_NODE -eq 1 ]; then
     fi
 
     if [ -s "$TOOL_HOME/.nvm/nvm.sh" ]; then
-        print_info "nvm already present for ${TOOL_USER}"
+        infra_info "nvm already present for ${TOOL_USER}"
     else
         run_as_user 'curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash >/dev/null 2>&1' \
-            && print_success "nvm installed for ${TOOL_USER}" \
-            || print_warning "nvm install failed for ${TOOL_USER} - skipping Node"
+            && infra_ok "nvm installed for ${TOOL_USER}" \
+            || infra_warn "nvm install failed for ${TOOL_USER} - skipping Node"
     fi
 
     if [ -s "$TOOL_HOME/.nvm/nvm.sh" ]; then
         run_as_user "export NVM_DIR=\"\$HOME/.nvm\"; . \"\$NVM_DIR/nvm.sh\"; nvm install ${NODE_VERSION} && nvm alias default '${node_default}'" >/dev/null 2>&1 \
-            && print_success "Node ${NODE_VERSION} installed (default: ${node_default})" \
-            || print_warning "Node ${NODE_VERSION} installation failed"
+            && infra_ok "Node ${NODE_VERSION} installed (default: ${node_default})" \
+            || infra_warn "Node ${NODE_VERSION} installation failed"
     fi
 fi
 
 # -------------------------------------------------------------------- starship
 
-# The prompt itself. Installed to /usr/local/bin rather than a home directory so
-# every user on the box gets the same one, and so a root shell renders the same
-# prompt as the invoking user's. git.sh picks it up when it is on PATH and keeps
-# its own PS1 as the fallback, so neither half depends on the other.
+# The prompt itself. On Linux it goes to /usr/local/bin rather than a home
+# directory so every user on the box gets the same one and a root shell renders
+# what the invoking user's does; elsewhere it is per-user like everything else.
+# git.sh picks it up from PATH and keeps its own PS1 as the fallback, so neither
+# half depends on the other.
 if [ $INSTALL_STARSHIP -eq 1 ]; then
-    print_info "Installing starship..."
+    infra_info "Installing starship..."
+    starship_bin="${BIN_DIR}/starship"
 
-    if [ -x /usr/local/bin/starship ] && [ $FORCE_REINSTALL -eq 0 ]; then
-        print_info "starship already present"
+    if [ -x "$starship_bin" ] && [ $FORCE_REINSTALL -eq 0 ]; then
+        infra_info "starship already present"
     else
         # -y skips the confirmation prompt, -b picks the bin dir. The installer
-        # writes nothing outside it - the shell wiring is git.sh's job.
-        curl -fsSL https://starship.rs/install.sh | sh -s -- -y -b /usr/local/bin >/dev/null 2>&1 \
-            && print_success "starship installed" \
-            || print_warning "starship install failed - see https://starship.rs"
+        # writes nothing outside it - the shell wiring is git.sh's job. It has
+        # builds for Linux, macOS and Windows, so the same call works on all.
+        curl -fsSL https://starship.rs/install.sh | sh -s -- -y -b "$BIN_DIR" >/dev/null 2>&1 \
+            && infra_ok "starship installed" \
+            || infra_warn "starship install failed - see https://starship.rs"
+    fi
+
+    # MSYS puts the .exe suffix on it; treat either as installed.
+    starship_present=0
+    if [ -x "$starship_bin" ] || [ -x "${starship_bin}.exe" ]; then
+        starship_present=1
     fi
 
     # The config belongs to the user whose shell renders the prompt, not root.
@@ -700,9 +912,9 @@ if [ $INSTALL_STARSHIP -eq 1 ]; then
     # it is a file people tune, and clobbering it on every run would undo that.
     starship_toml="${TOOL_HOME}/.config/starship.toml"
     if [ -f "$starship_toml" ] && [ $FORCE_REINSTALL -eq 0 ]; then
-        print_info "starship config already at ${starship_toml}"
-    elif [ -x /usr/local/bin/starship ]; then
-        run_as_user 'mkdir -p "$HOME/.config"'
+        infra_info "starship config already at ${starship_toml}"
+    elif [ $starship_present -eq 1 ]; then
+        mkdir -p "${TOOL_HOME}/.config"
         # Directory and git branch, in the shape the old hand-rolled PS1 had:
         # user@host:/current/path (branch:status)$
         cat > "$starship_toml" << 'EOF'
@@ -753,7 +965,7 @@ success_symbol = "[\\$](white)"
 error_symbol = "[\\$](red)"
 EOF
         chown "$TOOL_USER" "$starship_toml" 2>/dev/null || true
-        print_success "starship config written to ${starship_toml}"
+        infra_ok "starship config written to ${starship_toml}"
     fi
 
     # Machine-wide init. The per-user prompt is wired through git.sh, sourced
@@ -765,17 +977,31 @@ EOF
     # so it never double-inits when git.sh already ran, and is (re)written on
     # every run - it is managed, not a file people tune - so the fix lands even
     # when the user config above was left in place.
-    if [ -x /usr/local/bin/starship ]; then
+    #
+    # Only where an /etc/profile.d exists and is ours to write: macOS has the
+    # directory but nothing reads it, and MSYS has no such mechanism, so on both
+    # the per-user wiring at the end of this script is the whole story.
+    if [ $starship_present -eq 1 ] && [ "$NEEDS_ROOT" -eq 1 ] && [ -d /etc/profile.d ]; then
         cat > /etc/profile.d/starship.sh << 'EOF'
 # managed by infra install.sh - machine-wide starship prompt for login and
 # agent shells that never source a per-user ~/.bashrc. Edits are overwritten.
+#
+# Read by zsh too: Debian's /etc/zprofile sources /etc/profile, so this file has
+# to know which shell it landed in. $ZSH_VERSION is the unambiguous answer -
+# under sh emulation $0 is not the file and `declare` does not exist, so neither
+# is safe to test. Each branch skips its own init when starship is already up,
+# so a shell that also sources git.sh doesn't end up double-wrapped.
 case $- in *i*) ;; *) return 0 2>/dev/null || exit 0 ;; esac
 if command -v starship >/dev/null 2>&1; then
-    declare -F starship_precmd >/dev/null 2>&1 || eval "$(starship init bash)"
+    if [ -n "${ZSH_VERSION:-}" ]; then
+        [ -n "${STARSHIP_SESSION_KEY:-}" ] || eval "$(starship init zsh)"
+    else
+        declare -F starship_precmd >/dev/null 2>&1 || eval "$(starship init bash)"
+    fi
 fi
 EOF
         chmod 644 /etc/profile.d/starship.sh
-        print_success "starship init written to /etc/profile.d/starship.sh"
+        infra_ok "starship init written to /etc/profile.d/starship.sh"
     fi
 
     # Agents (claude, codex, ...) take over the whole terminal, so the shell
@@ -786,9 +1012,9 @@ EOF
     # merge is jq so the file's other keys (hooks, theme, ...) are untouched, and
     # it only writes when the statusLine is unset or already ours - a hand-tuned
     # one is left alone.
-    if [ -x /usr/local/bin/starship ]; then
+    if [ $starship_present -eq 1 ]; then
         statusline_sh="${TOOL_HOME}/.config/starship-statusline.sh"
-        run_as_user 'mkdir -p "$HOME/.config"'
+        mkdir -p "${TOOL_HOME}/.config"
         cat > "$statusline_sh" << 'EOF'
 #!/usr/bin/env bash
 # managed by infra install.sh --starship - Claude Code statusLine that renders
@@ -805,11 +1031,11 @@ starship prompt 2>/dev/null | sed 's/\\\[//g; s/\\\]//g; s/\\[$]/$/g' | tr -d '\
 EOF
         chmod 755 "$statusline_sh"
         chown "$TOOL_USER" "$statusline_sh" 2>/dev/null || true
-        print_success "starship statusLine script written to ${statusline_sh}"
+        infra_ok "starship statusLine script written to ${statusline_sh}"
 
         claude_settings="${TOOL_HOME}/.claude/settings.json"
         if command -v jq >/dev/null 2>&1; then
-            run_as_user 'mkdir -p "$HOME/.claude"'
+            mkdir -p "${TOOL_HOME}/.claude"
             [ -f "$claude_settings" ] || printf '{}\n' > "$claude_settings"
             cur_sl="$(jq -r '.statusLine.command // ""' "$claude_settings" 2>/dev/null)"
             case "$cur_sl" in
@@ -819,25 +1045,32 @@ EOF
                           '.statusLine = {type:"command", command:$c, padding:0}' \
                           "$claude_settings" > "$tmp" 2>/dev/null; then
                         mv "$tmp" "$claude_settings"
-                        print_success "Claude Code statusLine now shows the starship prompt"
+                        infra_ok "Claude Code statusLine now shows the starship prompt"
                     else
                         rm -f "$tmp"
-                        print_warning "could not update ${claude_settings} - set statusLine by hand"
+                        infra_warn "could not update ${claude_settings} - set statusLine by hand"
                     fi ;;
                 *)
-                    print_info "Claude Code already has a custom statusLine - left it alone" ;;
+                    infra_info "Claude Code already has a custom statusLine - left it alone" ;;
             esac
             chown "$TOOL_USER" "$claude_settings" 2>/dev/null || true
         else
-            print_warning "jq not found - skipped Claude statusLine wiring (install jq, then re-run --starship)"
+            infra_warn "jq not found - skipped Claude statusLine wiring (install jq, then re-run --starship)"
         fi
     fi
+fi
+
+# Everything under ~ was written as root when running under sudo; hand it back.
+if [ "$NEEDS_ROOT" -eq 1 ] && [ "$TOOL_USER" != root ]; then
+    for owned in "${TOOL_HOME}/.config" "${TOOL_HOME}/.claude"; do
+        [ -e "$owned" ] && chown -R "$TOOL_USER" "$owned" 2>/dev/null || true
+    done
 fi
 
 # ------------------------------------------------------------------------ done
 
 echo ""
-print_success "Installation complete"
+infra_ok "Installation complete on $(platform_label)"
 echo ""
 # Report only what this run touched, and only with `if` - under `set -e` a
 # trailing "[ test ] && echo" that tests false ends the script right here,
@@ -846,13 +1079,13 @@ if [ $INSTALL_PHP -eq 1 ]; then
     echo "  php       $(php -v 2>/dev/null | head -1)"
 fi
 if [ $INSTALL_COMPOSER -eq 1 ]; then
-    echo "  composer  $(COMPOSER_ALLOW_SUPERUSER=1 composer --version --no-ansi 2>/dev/null | head -1)"
+    echo "  composer  $(COMPOSER_ALLOW_SUPERUSER=1 "${BIN_DIR}/composer" --version --no-ansi 2>/dev/null | head -1)"
 fi
 if [ $INSTALL_WPCLI -eq 1 ]; then
-    echo "  wp        $(wp --version 2>/dev/null | head -1)"
+    echo "  wp        $("${BIN_DIR}/wp" --version 2>/dev/null | head -1)"
 fi
 if [ $INSTALL_NODE -eq 1 ]; then
-    node_ver="$(su - "${SUDO_USER:-root}" -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh" 2>/dev/null; node --version' 2>/dev/null | tail -1)"
+    node_ver="$(run_as_user 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh" 2>/dev/null; node --version' 2>/dev/null | tail -1)"
     if [ -n "$node_ver" ]; then
         echo "  node      ${node_ver} (via nvm)"
     fi
@@ -863,8 +1096,13 @@ fi
 if [ $INSTALL_GH -eq 1 ] && command -v gh >/dev/null 2>&1; then
     echo "  gh        $(gh --version 2>/dev/null | head -1)"
 fi
-if [ $INSTALL_STARSHIP -eq 1 ] && [ -x /usr/local/bin/starship ]; then
-    echo "  starship  $(/usr/local/bin/starship --version 2>/dev/null | head -1)"
+if [ $INSTALL_STARSHIP -eq 1 ]; then
+    # A per-user BIN_DIR may not be on PATH yet, so ask it by path when the name
+    # doesn't resolve - the PATH warning further down is the fix for that.
+    starship_bin="$(command -v starship 2>/dev/null || printf '%s' "${BIN_DIR}/starship")"
+    if [ -x "$starship_bin" ]; then
+        echo "  starship  $("$starship_bin" --version 2>/dev/null | head -1)"
+    fi
 fi
 echo ""
 if [ $INSTALL_PHP -eq 1 ]; then
@@ -878,15 +1116,20 @@ echo ""
 
 # ------------------------------------------------------------ shell integration
 
-# Make bash load git.sh (shortcuts, branch prompt, worktree helpers) in future
-# sessions. The repo is resolved from this script's own location, and the line
-# is written to the invoking user's ~/.bashrc - so it works wherever the
-# checkout lives and for whoever ran sudo, not a fixed path.
-INFRA_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Make the shell load git.sh (shortcuts, branch prompt, worktree helpers) in
+# future sessions. The repo is resolved from this script's own location and the
+# line goes into the invoking user's rc file - so it works wherever the checkout
+# lives and for whoever ran it, not a fixed path.
+#
+# Which rc file is not one answer: bash on macOS opens a *login* shell for every
+# Terminal window and never reads ~/.bashrc, and zsh - the macOS default since
+# Catalina - reads neither. Write to every file this user's shell will actually
+# open, and let the grep guard keep it to one line each.
+rc_files() { platform_rc_files "$TOOL_HOME" "$TOOL_SHELL"; }
+
 GIT_SH="${INFRA_DIR}/git.sh"
 if [ -f "$GIT_SH" ]; then
     src_line="[ -f \"$GIT_SH\" ] && source \"$GIT_SH\""
-    bashrc="${TOOL_HOME}/.bashrc"
     # A hand-written or older line may source the same file through $HOME rather
     # than the absolute path - match that form too, or every run appends a second
     # copy that grep for the absolute path never sees. Keep the literal $HOME.
@@ -895,27 +1138,40 @@ if [ -f "$GIT_SH" ]; then
         *)              GIT_SH_HOME="$GIT_SH" ;;
     esac
     # An earlier install may have written a commands.sh line for a file that no
-    # longer exists - drop it rather than leaving a dead source in ~/.bashrc.
+    # longer exists - drop it rather than leaving a dead source in the rc file.
     old_line="${INFRA_DIR}/commands.sh"
-    run_as_user "touch '$bashrc'
-        if grep -qF '$old_line' '$bashrc' 2>/dev/null; then
-            tmp=\$(mktemp) && grep -vF '$old_line' '$bashrc' > \"\$tmp\" && mv \"\$tmp\" '$bashrc'
+    for rc in $(rc_files); do
+        touch "$rc"
+        if grep -qF "$old_line" "$rc" 2>/dev/null; then
+            tmp="$(mktemp)" && grep -vF "$old_line" "$rc" > "$tmp" && mv "$tmp" "$rc"
         fi
-        grep -qF '$GIT_SH' '$bashrc' 2>/dev/null \
-            || grep -qF '$GIT_SH_HOME' '$bashrc' 2>/dev/null \
-            || printf '%s\n' '$src_line' >> '$bashrc'"
-    print_success "bash will auto-load git.sh (${GIT_SH})"
+        grep -qF "$GIT_SH" "$rc" 2>/dev/null \
+            || grep -qF "$GIT_SH_HOME" "$rc" 2>/dev/null \
+            || printf '%s\n' "$src_line" >> "$rc"
+        chown "$TOOL_USER" "$rc" 2>/dev/null || true
+        infra_ok "${rc} will auto-load git.sh"
+    done
 else
-    print_warning "no git.sh next to install.sh - skipping shell integration"
+    infra_warn "no git.sh next to install.sh - skipping shell integration"
 fi
 
-# Auto-reload bash so the new environment is live right away. A script can't
-# mutate its parent shell, so the closest thing is to exec a fresh login shell
-# for the invoking user - it re-reads ~/.bashrc and thus sources git.sh.
-# Only do this interactively so non-interactive/CI runs still return.
-if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != root ] && [ -t 0 ] && [ -t 1 ]; then
-    print_info "Reloading bash so the shell helpers and new tools are ready..."
+# A per-user BIN_DIR is no use if nothing looks in it.
+case ":${PATH}:" in
+    *":${BIN_DIR}:"*) ;;
+    *)  infra_warn "${BIN_DIR} is not on your PATH - add it:"
+        printf '    echo '\''export PATH="%s:$PATH"'\'' >> %s\n' \
+            "$BIN_DIR" "$(rc_files | head -1)" ;;
+esac
+
+# Auto-reload the shell so the new environment is live right away. A script
+# can't mutate its parent shell, so the closest thing is to exec a fresh login
+# shell for the invoking user - it re-reads the rc file and thus sources git.sh.
+# Only under sudo, where the shell we would return to is the wrong user's, and
+# only interactively so non-interactive/CI runs still return.
+if [ "$NEEDS_ROOT" -eq 1 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] \
+   && [ -t 0 ] && [ -t 1 ]; then
+    infra_info "Reloading the shell so the helpers and new tools are ready..."
     exec su - "$SUDO_USER"
 else
-    print_warning "Open a new shell (or 'source ${GIT_SH:-./git.sh}') to pick up the environment"
+    infra_warn "Open a new shell (or 'source ${GIT_SH:-./git.sh}') to pick up the environment"
 fi

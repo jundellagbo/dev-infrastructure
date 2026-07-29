@@ -1,93 +1,36 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Uninstall local web services before switching to Docker
+# Free the ports the Docker stack wants by taking down web services installed
+# straight onto the host.
+#
+# How much of that is possible differs per platform - Debian purges packages,
+# macOS can only stop Homebrew's services, Windows owns its own - so the work
+# lives in platforms/<os>.sh and this script picks the ports and reports.
+#
+# Database data directories are never removed on any platform.
 
 set -e
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INFRA_DIR="$(dirname "$SCRIPT_DIR")"
+PORTS="80 443 3306 5432 8080 8443"
 
-print_success() { echo -e "${GREEN}✓ $1${NC}"; }
-print_error() { echo -e "${RED}✗ $1${NC}"; }
-print_info() { echo -e "${BLUE}→ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}! $1${NC}"; }
+. "${INFRA_DIR}/platforms/platform.sh"
 
-if [ "$EUID" -ne 0 ]; then
-    print_error "This script must be run with sudo"
-    exit 1
-fi
+infra_banner "Freeing Ports on $(platform_label)"
+
+# The platform asks for root itself where it needs it - Windows has nothing here
+# to stop and should say so rather than demand an Administrator shell first.
+platform_free_ports || true
 
 echo ""
-echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}  Uninstalling Local Web Services${NC}"
-echo -e "${BLUE}========================================${NC}"
+infra_info "Checking the ports the stack needs..."
+# shellcheck disable=SC2086
+infra_report_ports $PORTS
+
+infra_banner "Done" "$INFRA_GREEN"
+echo "Ports the stack wants: ${PORTS}"
 echo ""
-
-# Stop services first
-print_info "Stopping services..."
-systemctl stop apache2 2>/dev/null || true
-systemctl stop nginx 2>/dev/null || true
-systemctl stop mysql 2>/dev/null || true
-systemctl stop postgresql 2>/dev/null || true
-print_success "Services stopped"
-
-# Disable services
-print_info "Disabling services..."
-systemctl disable apache2 2>/dev/null || true
-systemctl disable nginx 2>/dev/null || true
-systemctl disable mysql 2>/dev/null || true
-systemctl disable postgresql 2>/dev/null || true
-print_success "Services disabled"
-
-# Uninstall Apache
-print_info "Uninstalling Apache2..."
-apt-get purge -y apache2 apache2-utils apache2-bin libapache2-mod-php* 2>/dev/null || true
-apt-get autoremove -y 2>/dev/null || true
-rm -rf /etc/apache2 2>/dev/null || true
-print_success "Apache2 uninstalled"
-
-# Uninstall Nginx
-print_info "Uninstalling Nginx..."
-apt-get purge -y nginx nginx-common nginx-full 2>/dev/null || true
-apt-get autoremove -y 2>/dev/null || true
-rm -rf /etc/nginx 2>/dev/null || true
-print_success "Nginx uninstalled"
-
-# Uninstall MySQL
-print_info "Uninstalling MySQL..."
-apt-get purge -y mysql-server mysql-client mysql-common 2>/dev/null || true
-apt-get autoremove -y 2>/dev/null || true
-# Keep data by default, user can remove manually
-print_warning "MySQL data kept at /var/lib/mysql - remove manually if needed"
-print_success "MySQL uninstalled"
-
-# Uninstall PostgreSQL
-print_info "Uninstalling PostgreSQL..."
-apt-get purge -y postgresql postgresql-contrib 2>/dev/null || true
-apt-get autoremove -y 2>/dev/null || true
-# Keep data by default
-print_warning "PostgreSQL data kept at /var/lib/postgresql - remove manually if needed"
-print_success "PostgreSQL uninstalled"
-
-# Clean up
-print_info "Cleaning up..."
-apt-get autoclean -y 2>/dev/null || true
-print_success "Cleanup complete"
-
-echo ""
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  Uninstallation Complete!${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
-echo "Freed ports:"
-echo "  - 80, 443 (Nginx)"
-echo "  - 8080, 8443 (Apache)"
-echo "  - 3306 (MySQL)"
-echo "  - 5432 (PostgreSQL)"
-echo ""
-echo "You can now start Docker services:"
-echo "  cd $(dirname "$0")/.. && ./project-manager.sh start"
+echo "Start the Docker services:"
+echo "  cd ${INFRA_DIR} && docker compose up -d"
 echo ""

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Create a new project served by the automatic nginx vhost
 
@@ -8,9 +8,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INFRA_DIR="$(dirname "$SCRIPT_DIR")"
 DOMAIN_SUFFIX="dev.local"
 
+. "${INFRA_DIR}/platforms/platform.sh"
+
+# A .env written on Windows carries CRLF, and a trailing \r would end up inside
+# the path - a directory whose name ends in a carriage return is a bad afternoon.
 read_env_value() {
     local key="$1"
-    sed -n "s/^${key}=//p" "${INFRA_DIR}/.env" | tail -n 1
+    sed -n "s/^${key}=//p" "${INFRA_DIR}/.env" | tr -d '\r' | tail -n 1
 }
 
 if [ -f "${INFRA_DIR}/.env" ]; then
@@ -19,56 +23,49 @@ fi
 
 resolve_host_path() {
     case "$1" in
-        /*) printf '%s\n' "$1" ;;
+        # Absolute in either notation: /srv/www under a Unix shell, C:/... or
+        # //server/share when the .env points at a Windows-side directory.
+        /*|[A-Za-z]:[/\\]*) printf '%s\n' "$1" ;;
         *) printf '%s\n' "${INFRA_DIR}/${1#./}" ;;
     esac
 }
 
 WWW_PATH="$(resolve_host_path "${WWW_PATH:-./www}")"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-print_success() { echo -e "${GREEN}✓ $1${NC}"; }
-print_error() { echo -e "${RED}✗ $1${NC}"; }
-print_info() { echo -e "${BLUE}→ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}! $1${NC}"; }
-
-has_wildcard_host_dns() {
-    local probe="infra-host-dns-check.${DOMAIN_SUFFIX}"
-    getent hosts "$probe" 2>/dev/null | awk '{print $1}' | grep -qx "127.0.0.1"
-}
-
 ensure_host_dns() {
-    local domain="$1"
-    local entry="127.0.0.1 ${domain}"
+    local domain="$1" hosts entry="127.0.0.1 ${1}"
+    hosts="$(platform_hosts_file)"
 
-    if has_wildcard_host_dns; then
-        print_success "Wildcard host DNS already resolves *.${DOMAIN_SUFFIX}"
+    if infra_resolves_loopback "infra-host-dns-check.${DOMAIN_SUFFIX}"; then
+        infra_ok "Wildcard host DNS already resolves *.${DOMAIN_SUFFIX}"
         return
     fi
 
-    if grep -qF "$domain" /etc/hosts 2>/dev/null; then
-        print_success "Hosts entry already exists"
+    if grep -qF "$domain" "$hosts" 2>/dev/null; then
+        infra_ok "Hosts entry already exists in ${hosts}"
         return
     fi
 
-    print_info "Adding hosts entry for ${domain}..."
-    if [ -w /etc/hosts ]; then
-        printf '%s\n' "$entry" >> /etc/hosts
-        print_success "Added hosts entry"
+    infra_info "Adding hosts entry for ${domain} to ${hosts}..."
+    if [ -w "$hosts" ]; then
+        printf '%s\n' "$entry" >> "$hosts"
+        infra_ok "Added hosts entry"
     elif command -v sudo >/dev/null 2>&1 && [ -t 0 ]; then
-        printf '%s\n' "$entry" | sudo tee -a /etc/hosts >/dev/null && \
-            print_success "Added hosts entry" || \
-            print_warning "Could not add hosts entry"
+        if printf '%s\n' "$entry" | sudo tee -a "$hosts" >/dev/null; then
+            infra_ok "Added hosts entry"
+        else
+            infra_warn "Could not add hosts entry"
+        fi
     else
-        print_warning "Wildcard host DNS is not configured. For a persistent setup, run:"
-        echo "    sudo ${INFRA_DIR}/scripts/setup-host-dns.sh"
-        print_warning "Add to /etc/hosts (requires sudo):"
-        echo "    echo '${entry}' | sudo tee -a /etc/hosts"
+        infra_warn "Could not write ${hosts}. Add this line to it yourself:"
+        infra_note "$entry"
+        infra_warn "For a persistent wildcard instead of one line per project:"
+        infra_note "sudo ${INFRA_DIR}/scripts/setup-host-dns.sh"
+    fi
+
+    # WSL has a second hosts file, on the side the browser actually runs on.
+    if platform_windows_hosts_file >/dev/null 2>&1; then
+        wsl_browser_note
     fi
 }
 
@@ -84,7 +81,7 @@ usage() {
     exit 1
 }
 
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
     usage
 fi
 
@@ -92,21 +89,17 @@ PROJECT_NAME="$1"
 FULL_DOMAIN="${PROJECT_NAME}.${DOMAIN_SUFFIX}"
 WWW_DIR="${WWW_PATH}/${FULL_DOMAIN}"
 
-echo ""
-echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}  Creating Project: ${FULL_DOMAIN}${NC}"
-echo -e "${BLUE}========================================${NC}"
-echo ""
+infra_banner "Creating Project: ${FULL_DOMAIN}"
 
 if [ -d "$WWW_DIR" ]; then
-    print_error "Directory already exists: $WWW_DIR"
+    infra_err "Directory already exists: $WWW_DIR"
     exit 1
 fi
 
 # Create www directory
-print_info "Creating www directory..."
+infra_info "Creating www directory..."
 mkdir -p "${WWW_DIR}/public"
-print_success "Created ${WWW_DIR}/public"
+infra_ok "Created ${WWW_DIR}/public"
 
 # Create default index.php
 cat > "${WWW_DIR}/public/index.php" << 'EOF'
@@ -139,10 +132,10 @@ $projectName = basename(dirname(__DIR__));
         }
         h1 { color: #1a202c; margin-bottom: 1rem; }
         p { color: #718096; margin-bottom: 0.5rem; }
-        .php-version { 
-            background: #edf2f7; 
-            padding: 0.5rem 1rem; 
-            border-radius: 0.5rem; 
+        .php-version {
+            background: #edf2f7;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
             display: inline-block;
             margin-top: 1rem;
             font-family: monospace;
@@ -158,16 +151,12 @@ $projectName = basename(dirname(__DIR__));
 </body>
 </html>
 EOF
-print_success "Created index.php"
+infra_ok "Created index.php"
 
-print_success "Automatic nginx vhost: ${FULL_DOMAIN}"
+infra_ok "Automatic nginx vhost: ${FULL_DOMAIN}"
 ensure_host_dns "${FULL_DOMAIN}"
 
-echo ""
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  Project Created Successfully!${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
+infra_banner "Project Created Successfully!" "$INFRA_GREEN"
 echo "Project URL: http://${FULL_DOMAIN}"
 echo "Document root: ${WWW_DIR}/public"
 echo ""

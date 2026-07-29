@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Fix file permissions for WordPress projects in the infra Docker environment
 #
@@ -19,6 +19,11 @@
 #
 # WordPress config:
 #   FS_METHOD ............. 'direct'  (bypass FTP prompt for plugin/theme uploads)
+#
+# Platforms: the in-container half runs identically everywhere. The host-side
+# ACL step is Linux and WSL only - macOS and Windows bind mounts are translated
+# by Docker Desktop, which presents container-side ownership of its own and has
+# no setfacl to honour anyway. Everything else still applies there.
 
 set -e
 
@@ -27,16 +32,7 @@ INFRA_DIR="$(dirname "$SCRIPT_DIR")"
 CONTAINER="infra-php"
 WEB_ROOT="/var/www"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-print_success() { echo -e "${GREEN}✓ $1${NC}"; }
-print_error() { echo -e "${RED}✗ $1${NC}"; }
-print_info() { echo -e "${BLUE}→ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}! $1${NC}"; }
+. "${INFRA_DIR}/platforms/platform.sh"
 
 usage() {
     echo "Usage: $0 [project-name]"
@@ -55,20 +51,27 @@ usage() {
 }
 
 # Show help
-if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     usage
 fi
 
+infra_require_command docker || exit 1
+
 # Verify the PHP container is running
-if ! docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q "true"; then
-    print_error "Container '$CONTAINER' is not running. Start it with: docker compose up -d"
+if ! infra_docker_running "$CONTAINER"; then
+    infra_err "Container '$CONTAINER' is not running. Start it with: docker compose up -d"
     exit 1
 fi
 
 # Resolve the host-side path of the /var/www bind mount (used for ACLs, since
-# the Alpine container has no setfacl — ACLs set on the host apply in-container)
-HOST_WEB_ROOT=$(docker inspect "$CONTAINER" \
+# the Alpine container has no setfacl — ACLs set on the host apply in-container).
+# docker reports it in the host's own notation, so on Git Bash that comes back
+# as C:\... and has to be converted before any -d test can see it.
+HOST_WEB_ROOT=$(platform_docker inspect "$CONTAINER" \
     --format "{{range .Mounts}}{{if eq .Destination \"${WEB_ROOT}\"}}{{.Source}}{{end}}{{end}}" 2>/dev/null)
+if [ -n "$HOST_WEB_ROOT" ]; then
+    HOST_WEB_ROOT="$(platform_shell_path "$HOST_WEB_ROOT")"
+fi
 
 # Fix permissions for a single project (WordPress or not)
 fix_project() {
@@ -76,14 +79,11 @@ fix_project() {
     local project_name
     project_name=$(basename "$project_path")
 
-    echo ""
-    echo -e "${BLUE}────────────────────────────────────────${NC}"
-    echo -e "${BLUE}  Fixing: ${project_name}${NC}"
-    echo -e "${BLUE}────────────────────────────────────────${NC}"
+    infra_banner "Fixing: ${project_name}"
 
     # Determine the web-accessible root (public/ subdirectory if present)
     local public_root=""
-    if docker exec "$CONTAINER" test -d "${project_path}/public" 2>/dev/null; then
+    if platform_docker exec "$CONTAINER" test -d "${project_path}/public" 2>/dev/null; then
         public_root="${project_path}/public"
     else
         public_root="$project_path"
@@ -91,22 +91,22 @@ fix_project() {
 
     # Determine if this is a WordPress project
     local wp_root=""
-    if docker exec "$CONTAINER" test -f "${project_path}/wp-includes/version.php" 2>/dev/null; then
+    if platform_docker exec "$CONTAINER" test -f "${project_path}/wp-includes/version.php" 2>/dev/null; then
         wp_root="$project_path"
-    elif docker exec "$CONTAINER" test -f "${project_path}/public/wp-includes/version.php" 2>/dev/null; then
+    elif platform_docker exec "$CONTAINER" test -f "${project_path}/public/wp-includes/version.php" 2>/dev/null; then
         wp_root="${project_path}/public"
     fi
 
     if [ -n "$wp_root" ]; then
-        print_info "WordPress root: ${wp_root}"
+        infra_info "WordPress root: ${wp_root}"
     else
-        print_info "Web root: ${public_root} (not a WordPress project — fixing base permissions)"
+        infra_info "Web root: ${public_root} (not a WordPress project — fixing base permissions)"
     fi
 
     # ── 1. Set ownership: www:www-data (uid 1000:gid 82) ──
-    print_info "Setting ownership to www:www-data..."
-    docker exec -u root "$CONTAINER" chown -R www:www-data "$project_path"
-    print_success "Ownership set"
+    infra_info "Setting ownership to www:www-data..."
+    platform_docker exec -u root "$CONTAINER" chown -R www:www-data "$project_path"
+    infra_ok "Ownership set"
 
     # ── 2. Default ACLs so incoming files stay accessible ──
     # Default ACLs guarantee any NEW file is rw for the host user (uid 1000)
@@ -115,36 +115,41 @@ fix_project() {
     # Must run BEFORE the chmod step: non-root setfacl strips setgid bits.
     local host_project_path="${HOST_WEB_ROOT}/${project_name}"
     if command -v setfacl >/dev/null 2>&1 && [ -n "$HOST_WEB_ROOT" ] && [ -d "$host_project_path" ]; then
-        print_info "Applying default ACLs (new files: rw for uid 1000 + gid 82)..."
+        infra_info "Applying default ACLs (new files: rw for uid 1000 + gid 82)..."
         setfacl -R -m "u:1000:rwX,g:82:rwX,o::rX" "$host_project_path"
         setfacl -R -d -m "u::rwX,g::rwX,u:1000:rwX,g:82:rwX,o::rX" "$host_project_path"
-        print_success "Default ACLs applied"
+        infra_ok "Default ACLs applied"
+    elif platform_uses_posix_acls; then
+        infra_warn "setfacl unavailable or host path not found — skipping ACLs."
+        infra_warn "  Install it (apt-get install acl) or new PHP-created files may not"
+        infra_warn "  be writable from the host terminal."
     else
-        print_warning "setfacl unavailable or host path not found — skipping ACLs."
-        print_warning "New files created by PHP may not be writable from the host terminal."
+        # Docker Desktop's file sharing already presents everything to the host
+        # as the host user, so there is nothing for an ACL to fix.
+        infra_info "Skipping ACLs — Docker Desktop on $(platform_label) maps ownership for you"
     fi
 
     # ── 3. Base permissions: 2775 dirs (setgid), 664 files ──
     # setgid on directories makes every NEW file/dir inherit the www-data
     # group; group-writable files mean both the host user and PHP-FPM can
     # edit everything even where ACLs are unavailable.
-    print_info "Setting base permissions (dirs: 2775 setgid, files: 664)..."
-    docker exec -u root "$CONTAINER" find "$project_path" -type d -exec chmod 2775 {} +
-    docker exec -u root "$CONTAINER" find "$project_path" -type f -exec chmod 664 {} +
-    print_success "Base permissions set"
+    infra_info "Setting base permissions (dirs: 2775 setgid, files: 664)..."
+    platform_docker exec -u root "$CONTAINER" find "$project_path" -type d -exec chmod 2775 {} +
+    platform_docker exec -u root "$CONTAINER" find "$project_path" -type f -exec chmod 664 {} +
+    infra_ok "Base permissions set"
 
     # Stop here for non-WordPress projects
     if [ -z "$wp_root" ]; then
-        print_success "Done: ${project_name}"
+        infra_ok "Done: ${project_name}"
         return 0
     fi
 
     # ── 4. Secure wp-config.php (660: owner+group rw, not world-readable) ──
     for config_path in "${wp_root}/wp-config.php" "${project_path}/wp-config.php"; do
-        if docker exec "$CONTAINER" test -f "$config_path" 2>/dev/null; then
-            print_info "Securing wp-config.php (660)..."
-            docker exec -u root "$CONTAINER" chmod 660 "$config_path"
-            print_success "wp-config.php secured"
+        if platform_docker exec "$CONTAINER" test -f "$config_path" 2>/dev/null; then
+            infra_info "Securing wp-config.php (660)..."
+            platform_docker exec -u root "$CONTAINER" chmod 660 "$config_path"
+            infra_ok "wp-config.php secured"
             break
         fi
     done
@@ -153,49 +158,46 @@ fix_project() {
     # Without this, WordPress detects that file owner (www) ≠ PHP process user
     # (www-data) and asks for FTP credentials when installing plugins/themes.
     for config_path in "${project_path}/wp-config.php" "${wp_root}/wp-config.php"; do
-        if docker exec "$CONTAINER" test -f "$config_path" 2>/dev/null; then
-            if ! docker exec "$CONTAINER" grep -q "FS_METHOD" "$config_path" 2>/dev/null; then
-                print_info "Adding FS_METHOD 'direct' to wp-config.php..."
-                docker exec -u root "$CONTAINER" sh -c \
+        if platform_docker exec "$CONTAINER" test -f "$config_path" 2>/dev/null; then
+            if ! platform_docker exec "$CONTAINER" grep -q "FS_METHOD" "$config_path" 2>/dev/null; then
+                infra_info "Adding FS_METHOD 'direct' to wp-config.php..."
+                platform_docker exec -u root "$CONTAINER" sh -c \
                     "sed -i \"/That's all, stop editing/i define('FS_METHOD', 'direct');\" '$config_path'"
-                if docker exec "$CONTAINER" grep -q "FS_METHOD" "$config_path" 2>/dev/null; then
-                    print_success "FS_METHOD set to 'direct'"
+                if platform_docker exec "$CONTAINER" grep -q "FS_METHOD" "$config_path" 2>/dev/null; then
+                    infra_ok "FS_METHOD set to 'direct'"
                 else
-                    print_error "Failed to add FS_METHOD — please add manually:"
+                    infra_err "Failed to add FS_METHOD — please add manually:"
                     echo "        define('FS_METHOD', 'direct');"
                 fi
             else
-                print_success "FS_METHOD already defined in wp-config.php"
+                infra_ok "FS_METHOD already defined in wp-config.php"
             fi
             break
         fi
     done
 
     # ── 6. Ensure uploads directory exists ──
-    if ! docker exec "$CONTAINER" test -d "${wp_root}/wp-content/uploads" 2>/dev/null; then
-        print_info "Creating wp-content/uploads..."
-        docker exec -u root "$CONTAINER" mkdir -p "${wp_root}/wp-content/uploads"
-        docker exec -u root "$CONTAINER" chown www:www-data "${wp_root}/wp-content/uploads"
-        docker exec -u root "$CONTAINER" chmod 2775 "${wp_root}/wp-content/uploads"
-        print_success "uploads directory created"
+    if ! platform_docker exec "$CONTAINER" test -d "${wp_root}/wp-content/uploads" 2>/dev/null; then
+        infra_info "Creating wp-content/uploads..."
+        platform_docker exec -u root "$CONTAINER" mkdir -p "${wp_root}/wp-content/uploads"
+        platform_docker exec -u root "$CONTAINER" chown www:www-data "${wp_root}/wp-content/uploads"
+        platform_docker exec -u root "$CONTAINER" chmod 2775 "${wp_root}/wp-content/uploads"
+        infra_ok "uploads directory created"
     fi
 
-    print_success "Done: ${project_name}"
+    infra_ok "Done: ${project_name}"
 }
 
-echo ""
-echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}  WordPress Permission Fixer${NC}"
-echo -e "${BLUE}========================================${NC}"
+infra_banner "WordPress Permission Fixer"
 
 # Collect projects to process
-if [ -n "$1" ]; then
+if [ -n "${1:-}" ]; then
     # Specific project
     PROJECT_PATH="${WEB_ROOT}/$1"
-    if ! docker exec "$CONTAINER" test -d "$PROJECT_PATH" 2>/dev/null; then
-        print_error "Project not found: $1"
+    if ! platform_docker exec "$CONTAINER" test -d "$PROJECT_PATH" 2>/dev/null; then
+        infra_err "Project not found: $1"
         echo "  Available projects in ${WEB_ROOT}:"
-        docker exec "$CONTAINER" ls -1 "$WEB_ROOT" 2>/dev/null | while read -r dir; do
+        platform_docker exec "$CONTAINER" ls -1 "$WEB_ROOT" 2>/dev/null | tr -d '\r' | while read -r dir; do
             echo "    - $dir"
         done
         exit 1
@@ -204,22 +206,20 @@ if [ -n "$1" ]; then
 else
     # All projects
     FOUND=0
-    for project in $(docker exec "$CONTAINER" ls -1 "$WEB_ROOT" 2>/dev/null); do
+    # tr -d '\r': docker exec on Windows hands back CRLF, and a trailing \r
+    # inside the path makes every container-side test miss.
+    for project in $(platform_docker exec "$CONTAINER" ls -1 "$WEB_ROOT" 2>/dev/null | tr -d '\r'); do
         fix_project "${WEB_ROOT}/${project}"
         FOUND=$((FOUND + 1))
     done
 
     if [ "$FOUND" -eq 0 ]; then
-        print_warning "No projects found in ${WEB_ROOT}"
+        infra_warn "No projects found in ${WEB_ROOT}"
         exit 0
     fi
 fi
 
-echo ""
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  Permissions Fixed Successfully!${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
+infra_banner "Permissions Fixed Successfully!" "$INFRA_GREEN"
 echo "  Owner: www (uid 1000) — editable in your IDE/terminal"
 echo "  Group: www-data (gid 82) — writable by PHP-FPM (inherited via setgid)"
 echo "  New files: default ACLs keep them rw for both, regardless of umask"

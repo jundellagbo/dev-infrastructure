@@ -1,73 +1,34 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Configure persistent host DNS for *.dev.local on Linux.
+# Configure persistent wildcard DNS for *.dev.local on the host.
+#
+# Every platform gets there the same way - a dnsmasq answering 127.0.0.1 for the
+# whole suffix - but each wires it up differently, so the work lives in
+# platforms/<os>.sh and this script only picks the domain and reports.
+#
+# Run it with sudo (Administrator on Windows, where it will tell you there is
+# nothing to configure).
 
 set -euo pipefail
 
-DOMAIN_SUFFIX="dev.local"
-SERVICE_NAME="infra-dev-local-dns.service"
-SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INFRA_DIR="$(dirname "$SCRIPT_DIR")"
+DOMAIN_SUFFIX="dev.local"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+. "${INFRA_DIR}/platforms/platform.sh"
 
-print_success() { echo -e "${GREEN}✓ $1${NC}"; }
-print_error() { echo -e "${RED}✗ $1${NC}"; }
-print_info() { echo -e "${BLUE}→ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}! $1${NC}"; }
+infra_banner "Wildcard DNS for *.${DOMAIN_SUFFIX} on $(platform_label)"
 
-require_command() {
-    if ! command -v "$1" >/dev/null 2>&1; then
-        print_error "Missing required command: $1"
-        exit 1
-    fi
-}
+# The platform asks for root itself where it needs it - the ones that can't do
+# this at all should explain that rather than demand a sudo first.
+platform_setup_dns "$DOMAIN_SUFFIX" || exit 1
 
-if [ "$(id -u)" -ne 0 ]; then
-    print_error "Run this script with sudo:"
-    echo "    sudo $0"
-    exit 1
-fi
-
-require_command dnsmasq
-require_command resolvectl
-require_command systemctl
-
-print_info "Installing ${SERVICE_NAME}..."
-cat > "${SERVICE_PATH}" <<EOF
-[Unit]
-Description=Infra wildcard DNS for *.${DOMAIN_SUFFIX}
-Documentation=file://${INFRA_DIR}/README.md
-After=systemd-resolved.service
-Requires=systemd-resolved.service
-
-[Service]
-Type=simple
-ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --no-resolv --no-hosts --listen-address=127.0.0.1 --bind-interfaces --address=/${DOMAIN_SUFFIX}/127.0.0.1 --address=/.${DOMAIN_SUFFIX}/127.0.0.1
-ExecStartPost=/usr/bin/resolvectl dns lo 127.0.0.1
-ExecStartPost=/usr/bin/resolvectl domain lo ~${DOMAIN_SUFFIX}
-ExecStartPost=/usr/bin/resolvectl default-route lo false
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}"
-
-print_info "Verifying wildcard host DNS..."
-if getent hosts "health.${DOMAIN_SUFFIX}" | grep -q "127.0.0.1"; then
-    print_success "*.dev.local resolves to 127.0.0.1"
+infra_info "Verifying..."
+if infra_resolves_loopback "health.${DOMAIN_SUFFIX}"; then
+    infra_ok "*.${DOMAIN_SUFFIX} resolves to 127.0.0.1"
 else
-    print_warning "Could not verify wildcard DNS through getent"
-    print_warning "Check with: resolvectl query health.${DOMAIN_SUFFIX}"
+    infra_warn "Could not verify wildcard DNS"
+    infra_note "check with: ping -c1 health.${DOMAIN_SUFFIX}"
 fi
 
-print_success "Host DNS setup complete"
+infra_ok "Host DNS setup complete"

@@ -1,16 +1,27 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Generate self-signed wildcard SSL certificates for *.dev.local
-# These certificates will work for any subdomain: app.dev.local, api.dev.local, etc.
+# Generate a self-signed wildcard SSL certificate for *.dev.local, valid for any
+# subdomain: app.dev.local, api.dev.local, and so on.
+#
+# Generating it is identical everywhere - openssl is openssl. Trusting it is not,
+# so the instructions at the end come from platforms/<os>.sh. They are printed
+# rather than run: adding a root certificate is a decision to make with your eyes
+# open, and on half these platforms it needs a privilege this script doesn't have.
 
 set -e
 
-SSL_DIR="$(dirname "$0")/../ssl"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INFRA_DIR="$(dirname "$SCRIPT_DIR")"
+SSL_DIR="${INFRA_DIR}/ssl"
 DOMAIN="dev.local"
+
+. "${INFRA_DIR}/platforms/platform.sh"
+
+infra_require_command openssl || exit 1
 
 mkdir -p "$SSL_DIR"
 
-echo "Generating wildcard SSL certificate for *.${DOMAIN}..."
+infra_info "Generating wildcard SSL certificate for *.${DOMAIN}..."
 echo ""
 
 # Generate CA key and certificate
@@ -73,43 +84,20 @@ openssl x509 -req \
     -extensions v3_ca \
     -extfile "$SSL_DIR/wildcard.cnf"
 
-# Set permissions
+# A no-op on a Windows filesystem, which has no mode bits to set - harmless
+# there, and it keeps the key unreadable everywhere that does.
 chmod 600 "$SSL_DIR"/*.key
 chmod 644 "$SSL_DIR"/*.crt
 
-echo ""
-echo "=========================================="
-echo " SSL certificates generated successfully!"
-echo "=========================================="
-echo ""
+infra_banner "SSL certificates generated" "$INFRA_GREEN"
 echo "Files created in: $SSL_DIR"
-echo "  - ca.crt          (CA certificate - install this in your browser/OS)"
+echo "  - ca.crt          (CA certificate - trust this one)"
 echo "  - ca.key          (CA private key)"
-echo "  - wildcard.crt    (Wildcard certificate for *.dev.local)"
+echo "  - wildcard.crt    (Wildcard certificate for *.${DOMAIN})"
 echo "  - wildcard.key    (Wildcard private key)"
+
+infra_banner "Trust the CA on $(platform_label)"
+platform_trust_ca "${SSL_DIR}/ca.crt"
 echo ""
-echo "=========================================="
-echo " INSTALL CA CERTIFICATE IN WINDOWS"
-echo "=========================================="
+infra_firefox_note
 echo ""
-echo "The ca.crt file is located at:"
-echo "  WSL path: $SSL_DIR/ca.crt"
-echo ""
-echo "To find Windows path, run:"
-echo "  wslpath -w $SSL_DIR/ca.crt"
-echo ""
-echo "Installation steps:"
-echo "  1. Open Windows File Explorer and navigate to the ssl folder"
-echo "     (\\\\wsl$\\Ubuntu\\home\\jundell\\infra\\ssl or similar)"
-echo "  2. Double-click on 'ca.crt'"
-echo "  3. Click 'Install Certificate...'"
-echo "  4. Select 'Local Machine' and click Next"
-echo "  5. Select 'Place all certificates in the following store'"
-echo "  6. Click 'Browse' and select 'Trusted Root Certification Authorities'"
-echo "  7. Click Next, then Finish"
-echo "  8. Restart your browser"
-echo ""
-echo "Alternative: PowerShell (Run as Administrator):"
-echo "  Import-Certificate -FilePath \"\\\\wsl\$\\Ubuntu\\home\\jundell\\infra\\ssl\\ca.crt\" -CertStoreLocation Cert:\\LocalMachine\\Root"
-echo ""
-echo "=========================================="
